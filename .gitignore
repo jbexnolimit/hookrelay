@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Django
+backend/db.sqlite3
+backend/media/
+backend/staticfiles/
+
+# Rust
+rust-worker/target/
+
+# IDE
+.vscode/
+.idea/
+
+# Kafka and Docker local data
+kafka-data/
