@@ -1,0 +1,24 @@
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: hookrelay-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-hookrelay_db}
+      POSTGRES_USER: ${DB_USER:-hookrelay_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - hookrelay_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  hookrelay_postgres_data:

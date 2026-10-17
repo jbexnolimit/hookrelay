@@ -46,3 +46,31 @@ class DeliverySerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = fields
+
+class DeliveryResultInputSerializer(serializers.Serializer):
+    success = serializers.BooleanField()
+
+    http_status_code = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=100,
+        max_value=599,
+    )
+
+    response_time_ms = serializers.IntegerField(
+        required=False,
+        default=0,
+        min_value=0,
+    )
+
+    response_body = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+    )
+
+    error_message = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+    )
