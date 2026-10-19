@@ -48,6 +48,13 @@ INSTALLED_APPS = [
     "apps.devtools.apps.DevtoolsConfig",
 ]
 
+REST_FRAMEWORK = {
+    # Preserve your other existing settings.
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
+    ],
+}
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',

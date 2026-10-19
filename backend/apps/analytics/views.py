@@ -24,6 +24,14 @@ class AnalyticsSummaryView(APIView):
             response_time_ms__isnull=False
         ).aggregate(value=Avg("response_time_ms"))["value"]
 
+        completed = delivered + failed
+
+        success_rate_percent = (
+            round(delivered / completed * 100, 2)
+            if completed
+            else 0
+        )
+
         return Response({
             "total_events": total_events,
             "total_deliveries": total_deliveries,
@@ -33,8 +41,6 @@ class AnalyticsSummaryView(APIView):
                 "delivered": delivered,
                 "failed": failed,
             },
-            "success_rate_percent": round(delivered / total_deliveries * 100, 2)
-            if total_deliveries else 0,
-            "average_response_time_ms": round(float(average_response_time), 2)
-            if average_response_time is not None else None,
+            "success_rate_percent": success_rate_percent,
+            "average_response_time": average_response_time
         })

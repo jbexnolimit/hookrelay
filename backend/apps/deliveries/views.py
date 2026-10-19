@@ -1,8 +1,12 @@
-from rest_framework import mixins, viewsets
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+
+from django.db import transaction
+from django.utils import timezone
+
 
 from .models import Delivery, DeliveryAttempt
 from .serializers import (
@@ -20,7 +24,12 @@ class DeliveryViewSet(
 
     serializer_class = DeliverySerializer
     permission_classes = [AllowAny]  # Add authentication before production deployment.
-    queryset = Delivery.objects.select_related("event", "endpoint").all()
+    queryset = Delivery.objects.select_related(
+                "event",
+                "endpoint",
+            ).prefetch_related(
+                "attempts",
+        )
 
     def get_queryset(self):
         queryset = super().get_queryset()
