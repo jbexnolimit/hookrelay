@@ -1,18 +1,28 @@
-
 # HookRelay
 
-A webhook delivery system built with Django REST Framework, PostgreSQL, Apache Kafka, and a Rust worker.
+HookRelay is a webhook delivery system built with Django, PostgreSQL, Apache Kafka, and Rust. It receives events, creates delivery tasks for subscribed webhook endpoints, and processes deliveries asynchronously using a Rust worker.
 
-HookRelay accepts events through a REST API, creates delivery tasks for matching webhook endpoints, processes those tasks asynchronously through Kafka, sends HTTP requests to receivers, and reports delivery results back to Django.
+## Features
+
+- Event ingestion through REST APIs
+- Webhook endpoint registration and event subscriptions
+- Asynchronous delivery processing using Apache Kafka
+- Rust-based worker for HTTP webhook delivery
+- Delivery status and attempt tracking
+- Automatic retry scheduling with configurable backoff
+- Recovery of stale or interrupted deliveries
+- Idempotent delivery callback handling
+- Delivery analytics and monitoring
+- Docker Compose infrastructure for PostgreSQL and Kafka
 
 ## Tech Stack
 
 - **Backend:** Python, Django, Django REST Framework
 - **Database:** PostgreSQL
-- **Message Broker:** Apache Kafka (KRaft mode)
+- **Messaging:** Apache Kafka (KRaft)
 - **Worker:** Rust
-- **HTTP:** REST APIs and webhook receivers
-- **Development Environment:** Ubuntu 24.04 LTS on WSL 2
+- **Infrastructure:** Docker, Docker Compose
+- **Development Environment:** WSL2, Ubuntu
 
 ## Project Structure
 
@@ -21,380 +31,382 @@ hookrelay/
 ├── backend/
 │   ├── apps/
 │   │   ├── analytics/
-│   │   ├── core/
 │   │   ├── deliveries/
-│   │   ├── devtools/
 │   │   ├── events/
-│   │   └── webhooks/
+│   │   ├── webhooks/
+│   │   └── devtools/
 │   ├── config/
 │   ├── manage.py
-│   └── requirements.txt
+│   └── .env
+│
 ├── rust-worker/
 │   ├── src/
 │   ├── Cargo.toml
-│   └── Cargo.lock
-├── infra/
-│   └── kafka/
-│       └── README.md
+│   └── .env
+│
 ├── docker-compose.yml
+├── .env
 └── README.md
 ```
 
-## Prerequisites
+## Requirements
 
-The instructions below assume Ubuntu 24.04 running on WSL 2.
+- Ubuntu on WSL2 or a Linux environment
+- Python 3.12+
+- Rust and Cargo
+- Docker Desktop with WSL2 integration, or Docker Engine with Docker Compose
+- Git
 
-Install the required packages:
+PostgreSQL and Kafka run through Docker Compose, so you do not need to install them separately.
 
-```bash
-sudo apt update
-sudo apt install -y \
-  git curl wget \
-  build-essential cmake clang pkg-config \
-  python3 python3-pip python3-venv python3-dev \
-  libssl-dev zlib1g-dev \
-  libcurl4-openssl-dev libsasl2-dev \
-  postgresql postgresql-contrib postgresql-client \
-  openjdk-21-jdk
-```
+## Setup
 
-Install Rust using the official installer:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
-
-Verify the installations:
-
-```bash
-python3 --version
-cargo --version
-rustc --version
-java -version
-psql --version
-```
-
-## 1. Set Up the Project
-
-Clone the repository and enter the project directory:
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/jbexnolimit/hookrelay.git
 cd hookrelay
 ```
 
-Configure Git to normalize Windows line endings when adding files:
+### 2. Configure environment variables
 
-```bash
-git config --local core.autocrlf input
+Create the root `.env` file:
+
+```env
+DB_NAME=hookrelay_db
+DB_USER=hookrelay_user
+DB_PASSWORD=your_database_password
+DB_PORT=5433
 ```
 
-Create and activate the Python virtual environment:
+Create `backend/.env`:
+
+```env
+DB_NAME=hookrelay_db
+DB_USER=hookrelay_user
+DB_PASSWORD=your_database_password
+DB_HOST=127.0.0.1
+DB_PORT=5433
+
+KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
+KAFKA_DELIVERY_TOPIC=hookrelay.delivery-tasks
+```
+
+Create `rust-worker/.env`:
+
+```env
+KAFKA_BROKERS=127.0.0.1:9092
+KAFKA_TOPIC=hookrelay.delivery-tasks
+KAFKA_GROUP_ID=hookrelay-rust-worker
+
+DJANGO_API_BASE_URL=http://127.0.0.1:8001
+HTTP_TIMEOUT_SECONDS=10
+```
+
+Use the same database credentials in the root and Django environment files.
+
+### 3. Start PostgreSQL and Kafka
+
+Start the infrastructure:
+
+```bash
+docker compose up -d
+```
+
+Docker Compose starts:
+
+- PostgreSQL 16
+- Apache Kafka 4.3.1 in KRaft mode
+- Kafka topic initialization
+
+The Kafka initialization service automatically creates the `hookrelay.delivery-tasks` topic if it does not already exist.
+
+Check service status:
+
+```bash
+docker compose ps
+```
+
+Verify the Kafka topic:
+
+```bash
+docker compose exec kafka \
+  /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --list
+```
+
+Verify PostgreSQL:
+
+```bash
+docker compose exec postgres \
+  pg_isready -U hookrelay_user -d hookrelay_db
+```
+
+Both PostgreSQL and Kafka include health checks.
+
+### 4. Set up the Django backend
+
+Create and activate a virtual environment if you do not already have one:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-Install the backend dependencies:
+Install dependencies:
+
+```bash
+pip install -r backend/requirements.txt
+```
+
+Run database migrations:
 
 ```bash
 cd backend
-pip install -r requirements.txt
-```
-
-Return to the repository root when needed:
-
-```bash
-cd ..
-```
-
-## 2. Configure PostgreSQL
-
-Start PostgreSQL:
-
-```bash
-sudo service postgresql start
-```
-
-Open the PostgreSQL administrative shell:
-
-```bash
-sudo -u postgres psql
-```
-
-Create a development role and database:
-
-```sql
-CREATE ROLE hookrelay_user WITH LOGIN CREATEDB;
-CREATE DATABASE hookrelay_db OWNER hookrelay_user;
-\password hookrelay_user
-\q
-```
-
-If the role or database already exists, do not recreate it. Reuse your existing development setup.
-
-Test the connection:
-
-```bash
-psql -h 127.0.0.1 -U hookrelay_user -d hookrelay_db -W
-```
-
-Inside `psql`, run:
-
-```sql
-SELECT current_database(), current_user;
-\q
-```
-
-### Backend environment variables
-
-Create or update `backend/.env` using the variables expected by `backend/config/settings.py`.
-
-At minimum, configure the database connection:
-
-```dotenv
-DB_NAME=hookrelay_db
-DB_USER=hookrelay_user
-DB_PASSWORD=your_local_database_password
-DB_HOST=127.0.0.1
-DB_PORT=5432
-```
-
-Keep the project's other required environment variables. Use your own local credentials, and never commit `.env` files.
-
-Run the migrations and seed the demo receivers:
-
-```bash
-cd ~/projects/hookrelay/backend
-source ~/projects/hookrelay/.venv/bin/activate
-
-python manage.py check
 python manage.py migrate
-python manage.py seed_demo
 ```
 
-The demo seed command creates the Inventory Demo Receiver and Failure Demo Receiver.
-
-## 3. Set Up Apache Kafka
-
-Download and extract Kafka outside the repository:
+Start the Django API:
 
 ```bash
-mkdir -p ~/apps
-cd ~/apps
-
-wget https://archive.apache.org/dist/kafka/4.3.1/kafka_2.13-4.3.1.tgz
-tar -xzf kafka_2.13-4.3.1.tgz
-
-cd ~/apps/kafka_2.13-4.3.1
-```
-
-Kafka runs in KRaft mode and does not require ZooKeeper.
-
-### Initialize Kafka storage
-
-**Only perform this step when initializing a fresh Kafka data directory.** Do not reformat an existing initialized Kafka storage directory.
-
-```bash
-KAFKA_CLUSTER_ID="$(bin/kafka-storage.sh random-uuid)"
-
-bin/kafka-storage.sh format \
-  --standalone \
-  -t "$KAFKA_CLUSTER_ID" \
-  -c config/server.properties
-```
-
-### Start the Kafka broker
-
-Keep the broker running in its own terminal:
-
-```bash
-cd ~/apps/kafka_2.13-4.3.1
-bin/kafka-server-start.sh config/server.properties
-```
-
-### Create the delivery topic
-
-In a separate terminal:
-
-```bash
-cd ~/apps/kafka_2.13-4.3.1
-
-bin/kafka-topics.sh \
-  --create \
-  --topic hookrelay.delivery-tasks \
-  --bootstrap-server 127.0.0.1:9092 \
-  --partitions 1 \
-  --replication-factor 1
-```
-
-If the topic already exists, keep it and verify it:
-
-```bash
-bin/kafka-topics.sh \
-  --list \
-  --bootstrap-server 127.0.0.1:9092
-```
-
-The expected topic is:
-
-```text
-hookrelay.delivery-tasks
-```
-
-See [infra/kafka/README.md](infra/kafka/README.md) for additional Kafka notes.
-
-## 4. Configure and Run the Rust Worker
-
-The Rust worker uses environment variables from `rust-worker/.env`.
-
-Ensure the file contains the required settings, keeping any existing required variables:
-
-```dotenv
-KAFKA_BROKERS=127.0.0.1:9092
-KAFKA_TOPIC=hookrelay.delivery-tasks
-KAFKA_GROUP_ID=hookrelay-rust-worker
-DJANGO_API_BASE_URL=http://127.0.0.1:8001
-HTTP_TIMEOUT_SECONDS=10
-```
-
-Do not commit credentials or private configuration.
-
-Build the worker:
-
-```bash
-cd ~/projects/hookrelay/rust-worker
-cargo check
-cargo test
-```
-
-Run the worker:
-
-```bash
-cargo run
-```
-
-Keep the worker running in its own terminal.
-
-## 5. Start the Django API
-
-Open another terminal:
-
-```bash
-cd ~/projects/hookrelay/backend
-source ~/projects/hookrelay/.venv/bin/activate
-
-python manage.py runserver 8001
+python manage.py runserver 0.0.0.0:8001
 ```
 
 The API is available at:
 
 ```text
-http://127.0.0.1:8001/
+http://127.0.0.1:8001
 ```
 
-Useful endpoints:
+### 5. Start the Rust worker
 
-| Endpoint | Purpose |
-|---|---|
-| `/api/webhooks/` | Manage webhook endpoints |
-| `/api/events/` | Create and retrieve events |
-| `/api/deliveries/` | Inspect deliveries |
-| `/api/analytics/` | View delivery analytics |
-| `/api/dev/receiver/success/` | Demo receiver that succeeds |
-| `/api/dev/receiver/fail/` | Demo receiver that fails |
-
-## 6. Run an End-to-End Test
-
-Ensure PostgreSQL, Kafka, Django, and the Rust worker are running.
-
-Submit a test event from another terminal:
+Open another terminal:
 
 ```bash
-curl -i -X POST http://127.0.0.1:8001/api/events/ \
-  -H 'Content-Type: application/json' \
+cd ~/projects/hookrelay/rust-worker
+cargo run
+```
+
+The worker connects to Kafka, consumes delivery tasks, sends HTTP requests to webhook endpoints, and reports delivery results back to Django.
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET, POST | `/api/webhooks/` | Manage webhook endpoints |
+| GET, POST | `/api/events/` | Submit and retrieve events |
+| GET | `/api/deliveries/` | View delivery records |
+| GET | `/api/analytics/` | View delivery analytics |
+| POST | `/api/dev/receiver/success/` | Successful demo receiver |
+| POST | `/api/dev/receiver/fail/` | Failing demo receiver |
+
+### Example: Submit an event
+
+```bash
+curl -X POST http://127.0.0.1:8001/api/events/ \
+  -H "Content-Type: application/json" \
   -d '{
     "event_type": "order.created",
     "payload": {
-      "order_id": "ORD-2026-1022",
-      "total": 1499,
-      "currency": "PHP"
+      "order_ref": "ORD-1001",
+      "amount_minor": 200000,
+      "currency": "PHP",
+      "status": "placed"
     }
   }'
 ```
 
-The expected workflow is:
+The API stores the event, finds active webhook subscriptions matching its event type, creates delivery records, and publishes delivery tasks to Kafka.
 
-1. Django creates the event and its matching delivery.
-2. Django publishes the delivery task to Kafka.
-3. The Rust worker consumes the task.
-4. The worker sends an HTTP request to the webhook receiver.
-5. The worker reports the result to Django.
-6. Django records the delivery result in PostgreSQL.
-7. The worker commits the Kafka message after processing.
-
-For a successful receiver, expect HTTP 200 from the receiver and a successful delivery result recorded by Django.
-
-Check the Django and worker logs if any step fails.
-
-## 7. Troubleshooting
-
-### Kafka connection errors
-
-Check that the broker is running and the topic exists:
+### View deliveries
 
 ```bash
-cd ~/apps/kafka_2.13-4.3.1
-bin/kafka-topics.sh --list --bootstrap-server 127.0.0.1:9092
+curl http://127.0.0.1:8001/api/deliveries/
 ```
 
-### PostgreSQL connection errors
+Delivery records include:
 
-Check the PostgreSQL cluster:
+- Delivery status
+- Attempt count and maximum attempts
+- Last HTTP response status
+- Last attempt timestamp
+- Next retry time
+- Delivery error details
+
+## How Delivery Processing Works
+
+1. A client submits an event to the Django API.
+2. Django stores the event in PostgreSQL.
+3. Matching active webhook endpoints are identified based on their subscribed event types.
+4. Django creates delivery records and publishes tasks to Kafka.
+5. The Rust worker consumes the tasks.
+6. The worker sends HTTP POST requests to the target webhook endpoints.
+7. The worker reports the delivery result to Django.
+8. Django updates the delivery status and records the attempt.
+9. The worker commits the Kafka message after processing.
+
+## Retry Handling
+
+HookRelay automatically retries eligible failed deliveries.
+
+**Retryable failures:**
+- Network and connection failures
+- HTTP 408 and 429
+- HTTP 5xx responses
+
+Other HTTP 4xx responses are treated as permanent failures.
+
+**Retry schedule:**
+
+| Retry | Delay |
+|---|---:|
+| 1 | 30 seconds |
+| 2 | 60 seconds |
+| 3 | 120 seconds |
+| 4 | 240 seconds |
+
+The system allows up to 5 total delivery attempts.
+
+### Retry scheduler
+
+The Django management command identifies deliveries that are due for retry and republishes their tasks to Kafka. It also recovers stale deliveries that were interrupted while queued or processing.
+
+Run manually:
 
 ```bash
-pg_lsclusters
-sudo service postgresql status
+cd backend
+
+python manage.py process_delivery_retries \
+  --batch-size 100 \
+  --stale-after-seconds 300
 ```
 
-Verify the database name, username, password, host, and port in `backend/.env`.
+The scheduler can also be configured to run every minute through cron.
 
-### Rust build errors
-
-Confirm that native build dependencies are installed:
+Create its log directory:
 
 ```bash
-sudo apt install -y \
-  build-essential cmake clang pkg-config \
-  libssl-dev zlib1g-dev \
-  libcurl4-openssl-dev libsasl2-dev
+mkdir -p ~/.local/state/hookrelay
 ```
 
-Then retry:
+Add this to your crontab using `crontab -e`:
+
+```cron
+* * * * * /usr/bin/flock -n /tmp/hookrelay-retry-scheduler.lock /bin/bash -lc 'cd "$HOME/projects/hookrelay/backend" && "$HOME/projects/hookrelay/.venv/bin/python" manage.py process_delivery_retries --batch-size 100 --stale-after-seconds 300' >> "$HOME/.local/state/hookrelay/retry-scheduler.log" 2>&1
+```
+
+View scheduler logs:
 
 ```bash
-cd ~/projects/hookrelay/rust-worker
-cargo check
+tail -f ~/.local/state/hookrelay/retry-scheduler.log
 ```
 
-### Django errors
+The WSL environment must be running for its cron service and local worker processes to operate.
 
-Activate the correct virtual environment and run:
+## Running Tests
+
+Run the delivery application tests:
 
 ```bash
-cd ~/projects/hookrelay/backend
-source ~/projects/hookrelay/.venv/bin/activate
-
-python manage.py check
-python manage.py showmigrations
+cd backend
+python manage.py test apps.deliveries
 ```
+
+The delivery test suite covers:
+
+- Successful and failed delivery handling
+- Retry eligibility and scheduling
+- Permanent failure handling
+- Stale delivery recovery
+- Kafka publishing failures
+- Callback idempotency
+- Late delivery callbacks
+
+## Docker Commands
+
+Start infrastructure:
+
+```bash
+docker compose up -d
+```
+
+View running containers:
+
+```bash
+docker compose ps
+```
+
+View logs:
+
+```bash
+docker compose logs -f postgres kafka
+```
+
+Stop infrastructure:
+
+```bash
+docker compose down
+```
+
+Docker Compose uses named volumes to persist PostgreSQL and Kafka data. Stopping the containers does not remove this data.
+
+**Warning:** Avoid `docker compose down -v` unless you intentionally want to delete the persistent volumes and their data.
+
+## Troubleshooting
+
+**Docker permission denied**
+
+Check Docker access:
+
+```bash
+docker run --rm hello-world
+```
+
+If necessary, add your WSL user to the Docker group and reopen the terminal:
+
+```bash
+sudo usermod -aG docker "$USER"
+```
+
+**PostgreSQL connection refused**
+
+Check the container:
+
+```bash
+docker compose ps
+docker compose logs postgres
+```
+
+Confirm that Django uses `127.0.0.1:5433`.
+
+**Kafka connection refused**
+
+Check Kafka health:
+
+```bash
+docker compose ps
+docker compose logs kafka
+```
+
+Verify the topic:
+
+```bash
+docker compose exec kafka \
+  /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --list
+```
+
+**Worker is not processing deliveries**
+
+Check that Kafka is healthy, the topic exists, and the Rust worker environment points to `127.0.0.1:9092`.
+
+Also confirm that the Django API is running and accessible at `http://127.0.0.1:8001`.
 
 ## Development Notes
 
-- Run the project from the Linux filesystem under `~/projects/hookrelay`.
-- Keep the Kafka installation and runtime data outside the repository.
-- Keep `.env`, local credentials, Python virtual environments, and Rust build artifacts out of Git.
-- The included development server and single-broker Kafka configuration are for local development, not production deployment.
-- `cargo test` passing with zero discovered tests does not constitute comprehensive worker test coverage.
+- Docker Compose manages PostgreSQL and Kafka; Django and the Rust worker run locally during development.
+- PostgreSQL and Kafka data are persisted using Docker named volumes.
+- The retry scheduler runs separately from the Django API and Rust worker.
+- Local development configuration is intended for testing and development, not production deployment.

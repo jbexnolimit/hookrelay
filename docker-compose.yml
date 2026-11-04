@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: ${DB_USER:-hookrelay_user}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "${DB_PORT:-5433}:5432"
     volumes:
       - hookrelay_postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -42,6 +42,32 @@ services:
       KAFKA_NUM_PARTITIONS: 1
     volumes:
       - hookrelay_kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-init:
+    image: apache/kafka:4.3.1
+    container_name: hookrelay-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:29092 \
+          --create \
+          --if-not-exists \
+          --topic hookrelay.delivery-tasks \
+          --partitions 1 \
+          --replication-factor 1
+    restart: "no"
 
 volumes:
   hookrelay_postgres_data:

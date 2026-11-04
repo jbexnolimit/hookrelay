@@ -21,6 +21,8 @@ pub async fn process_delivery(client: &Client, config: &Config, task: &DeliveryT
         "payload": &task.payload,
     });
 
+    let attempt_id = uuid::Uuid::new_v4();
+
     let result = match client
         .post(&task.webhook_url)
         .json(&event_body)
@@ -38,6 +40,7 @@ pub async fn process_delivery(client: &Client, config: &Config, task: &DeliveryT
             let success = status.is_success();
 
             DeliveryResult {
+                attempt_id,
                 success,
                 http_status_code: Some(status.as_u16()),
                 response_time_ms: started.elapsed().as_millis() as u64,
@@ -50,12 +53,14 @@ pub async fn process_delivery(client: &Client, config: &Config, task: &DeliveryT
             }
         }
         Err(error) => DeliveryResult {
+            attempt_id,
             success: false,
             http_status_code: None,
             response_time_ms: started.elapsed().as_millis() as u64,
             response_body: String::new(),
             error_message: error.to_string(),
         },
+            
     };
 
     // Report the result to Django.

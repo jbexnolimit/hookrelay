@@ -1,6 +1,6 @@
 from rest_framework import serializers
-
 from .models import Delivery, DeliveryAttempt
+import uuid
 
 
 class DeliveryAttemptSerializer(serializers.ModelSerializer):
@@ -8,6 +8,7 @@ class DeliveryAttemptSerializer(serializers.ModelSerializer):
         model = DeliveryAttempt
         fields = [
             "id",
+            "attempt_id",
             "delivery",
             "attempt_number",
             "result",
@@ -50,6 +51,7 @@ class DeliverySerializer(serializers.ModelSerializer):
 class DeliveryResultInputSerializer(serializers.Serializer):
     success = serializers.BooleanField()
 
+    attempt_id = serializers.UUIDField(required=True)
     http_status_code = serializers.IntegerField(
         required=False,
         allow_null=True,

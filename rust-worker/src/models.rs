@@ -12,6 +12,7 @@ pub struct DeliveryTask {
 
 #[derive(Debug, Serialize)]
 pub struct DeliveryResult {
+    pub attempt_id: uuid::Uuid,
     pub success: bool,
     pub http_status_code: Option<u16>,
     pub response_time_ms: u64,

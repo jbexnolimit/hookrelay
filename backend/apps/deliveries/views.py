@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from .retry import schedule_retry
 
 from django.db import transaction
 from django.utils import timezone
@@ -80,6 +81,41 @@ class DeliveryViewSet(
                 pk=delivery.pk
             )
 
+            attempt_id = result_data["attempt_id"]
+
+            existing_attempt = DeliveryAttempt.objects.filter(
+                attempt_id=attempt_id
+            ).first()
+
+            if existing_attempt is not None:
+                if existing_attempt.delivery_id != delivery.pk:
+                    return Response(
+                        {"message": "Attempt ID belongs to another delivery."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                return Response(
+                    {
+                        "message": "Callback already processed.",
+                        "delivery": DeliverySerializer(delivery).data,
+                        "attempt": DeliveryAttemptSerializer(existing_attempt).data,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            if delivery.status in (
+                Delivery.Status.DELIVERED,
+                Delivery.Status.FAILED,
+            ):
+                return Response(
+                    {
+                        "message": "Delivery is already terminal; callback ignored.",
+                        "delivery": DeliverySerializer(delivery).data,
+                        "attempt": None,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
             now = timezone.now()
             attempt_number = delivery.attempt_count + 1
             succeeded = result_data["success"]
@@ -88,6 +124,7 @@ class DeliveryViewSet(
             # Save the individual HTTP delivery attempt.
             attempt = DeliveryAttempt.objects.create(
                 delivery=delivery,
+                attempt_id=attempt_id,
                 attempt_number=attempt_number,
                 result=(
                     DeliveryAttempt.Result.SUCCESS
@@ -120,9 +157,11 @@ class DeliveryViewSet(
                 delivery.next_retry_at = None
                 delivery.last_error = ""
             else:
-                delivery.status = Delivery.Status.FAILED
                 delivery.delivered_at = None
-                delivery.next_retry_at = None
+                schedule_retry(
+                    delivery,
+                    result_data.get("http_status_code"),
+                )
 
             delivery.save(
                 update_fields=[

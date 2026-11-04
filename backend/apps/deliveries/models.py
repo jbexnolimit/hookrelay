@@ -1,5 +1,6 @@
 
 from django.db import models
+import uuid
 
 
 class Delivery(models.Model):
@@ -98,6 +99,12 @@ class DeliveryAttempt(models.Model):
     error_message = models.TextField(blank=True, default="")
 
     attempted_at = models.DateTimeField(auto_now_add=True)
+    attempt_id = models.UUIDField(
+    null=True,
+    blank=True,
+    unique=True,
+    editable=False,
+    )
 
     class Meta:
         ordering = ["attempt_number"]

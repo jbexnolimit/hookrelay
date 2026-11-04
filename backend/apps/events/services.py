@@ -37,7 +37,7 @@ def publish_delivery_task(delivery):
     """Publish a task built from a saved Delivery and its related records."""
     topic = os.getenv(
         "KAFKA_DELIVERY_TOPIC",
-        "hookrelay-delivery-tasks",
+        "hookrelay.delivery-tasks",
     )
 
     task = {
