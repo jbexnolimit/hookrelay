@@ -1,10 +1,13 @@
 from django.db.models import Avg, Count
+from django.db.models.functions import TruncDate
+from django.utils import timezone
+from datetime import datetime, time, timedelta
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
 from apps.deliveries.models import Delivery, DeliveryAttempt
 from apps.events.models import Event
+
 
 
 class AnalyticsSummaryView(APIView):
@@ -42,3 +45,57 @@ class AnalyticsSummaryView(APIView):
             "success_rate_percent": success_rate_percent,
             "average_response_time": average_response_time
         })
+
+
+class DeliveryActivityView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        current_tz = timezone.get_current_timezone()
+        today = timezone.localdate()
+        start_date = today - timedelta(days=6)
+
+        start_at = timezone.make_aware(
+            datetime.combine(start_date, time.min),
+            current_tz,
+        )
+        end_at = timezone.make_aware(
+            datetime.combine(today + timedelta(days=1), time.min),
+            current_tz,
+        )
+
+        rows = (
+            Delivery.objects.filter(
+                created_at__gte=start_at,
+                created_at__lt=end_at,
+            )
+            .annotate(
+                day=TruncDate("created_at", tzinfo=current_tz),
+            )
+            .values("day", "status")
+            .annotate(total=Count("id"))
+            .order_by("day")
+        )
+
+        daily_counts = {}
+
+        for row in rows:
+            day = row["day"].isoformat()
+            daily_counts.setdefault(day, {})[row["status"]] = row["total"]
+
+        days = []
+
+        for offset in range(7):
+            day = start_date + timedelta(days=offset)
+            date_key = day.isoformat()
+            counts = daily_counts.get(date_key, {})
+
+            days.append({
+                "date": date_key,
+                "queued": counts.get(Delivery.Status.QUEUED, 0),
+                "processing": counts.get(Delivery.Status.PROCESSING, 0),
+                "delivered": counts.get(Delivery.Status.DELIVERED, 0),
+                "failed": counts.get(Delivery.Status.FAILED, 0),
+            })
+
+        return Response({"days": days})
