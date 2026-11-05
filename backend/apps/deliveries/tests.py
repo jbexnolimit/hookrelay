@@ -145,12 +145,22 @@ class DeliveryRetryCommandTests(TestCase):
         side_effect=RuntimeError("Kafka unavailable"),
     )
     def test_publish_failure_restores_queued_status(self, publish_mock):
+        before = timezone.now()
+
         call_command("process_delivery_retries")
 
         self.delivery.refresh_from_db()
         publish_mock.assert_called_once()
         self.assertEqual(self.delivery.status, Delivery.Status.QUEUED)
         self.assertIsNotNone(self.delivery.next_retry_at)
+        self.assertGreater(
+            self.delivery.next_retry_at,
+            before + timedelta(seconds=29),
+        )
+        self.assertLessEqual(
+            self.delivery.next_retry_at,
+            timezone.now() + timedelta(seconds=30),
+        )
 
     @patch(
         "apps.deliveries.management.commands.process_delivery_retries."
@@ -348,3 +358,149 @@ class DeliveryResultCallbackTests(TestCase):
             ).count(),
             0,
         )
+
+class ManualDeliveryRetryTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+        event = Event.objects.create(
+            event_type="order.created",
+            payload={"order_ref": "ORD-MANUAL-RETRY"},
+        )
+        endpoint = WebhookEndpoint.objects.create(
+            slug="manual-retry-test",
+            name="Manual Retry Test",
+            url="http://127.0.0.1:8002/api/v1/webhooks/hookrelay",
+            event_types=["order.created"],
+            is_active=True,
+        )
+        self.delivery = Delivery.objects.create(
+            event=event,
+            endpoint=endpoint,
+            status=Delivery.Status.FAILED,
+            attempt_count=5,
+            max_attempts=5,
+            last_error="Maximum automatic attempts reached.",
+        )
+        self.url = f"/api/deliveries/{self.delivery.pk}/retry/"
+
+    @patch("apps.deliveries.views.publish_delivery_task")
+    def test_failed_delivery_can_be_manually_retried(self, publish_mock):
+        response = self.client.post(self.url, {}, format="json")
+
+        self.assertEqual(response.status_code, 202)
+        publish_mock.assert_called_once()
+
+        self.delivery.refresh_from_db()
+        self.assertEqual(
+            self.delivery.status,
+            Delivery.Status.PROCESSING,
+        )
+        self.assertEqual(self.delivery.attempt_count, 5)
+        self.assertIsNone(self.delivery.next_retry_at)
+        self.assertEqual(self.delivery.last_error, "")
+
+    @patch("apps.deliveries.views.publish_delivery_task")
+    def test_non_failed_delivery_cannot_be_retried(self, publish_mock):
+        self.delivery.status = Delivery.Status.DELIVERED
+        self.delivery.save(update_fields=["status"])
+
+        response = self.client.post(self.url, {}, format="json")
+
+        self.assertEqual(response.status_code, 409)
+        publish_mock.assert_not_called()
+
+        self.delivery.refresh_from_db()
+        self.assertEqual(
+            self.delivery.status,
+            Delivery.Status.DELIVERED,
+        )
+
+    @patch(
+        "apps.deliveries.views.publish_delivery_task",
+        side_effect=RuntimeError("Kafka unavailable"),
+    )
+    def test_publish_failure_restores_failed_status(self, publish_mock):
+        response = self.client.post(self.url, {}, format="json")
+
+        self.assertEqual(response.status_code, 503)
+        publish_mock.assert_called_once()
+
+        self.delivery.refresh_from_db()
+        self.assertEqual(
+            self.delivery.status,
+            Delivery.Status.FAILED,
+        )
+        self.assertIsNone(self.delivery.next_retry_at)
+        self.assertEqual(
+            self.delivery.last_error,
+            "Manual retry could not be published.",
+        )
+        self.assertEqual(self.delivery.attempt_count, 5)
+
+
+class RetrySchedulerCommandTests(SimpleTestCase):
+    command_path = (
+        "apps.deliveries.management.commands."
+        "run_delivery_retry_scheduler"
+    )
+
+    @patch(f"{command_path}.time.sleep", side_effect=KeyboardInterrupt)
+    @patch(f"{command_path}.call_command")
+    def test_runs_retry_command_and_stops_cleanly(
+        self, call_command_mock, sleep_mock
+    ):
+        call_command(
+            "run_delivery_retry_scheduler",
+            interval=0.5,
+            batch_size=25,
+            stale_after_seconds=120,
+        )
+
+        call_command_mock.assert_called_once_with(
+            "process_delivery_retries",
+            batch_size=25,
+            stale_after_seconds=120,
+        )
+        sleep_mock.assert_called_once_with(0.5)
+
+    @patch(f"{command_path}.time.sleep", side_effect=KeyboardInterrupt)
+    @patch(
+        f"{command_path}.call_command",
+        side_effect=RuntimeError("Simulated scheduler failure"),
+    )
+    def test_logs_run_failure_and_stops_cleanly(
+        self, call_command_mock, sleep_mock
+    ):
+        from io import StringIO
+
+        stdout = StringIO()
+        stderr = StringIO()
+
+        call_command(
+            "run_delivery_retry_scheduler",
+            interval=1,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+        call_command_mock.assert_called_once()
+        sleep_mock.assert_called_once_with(1)
+        self.assertIn("Retry scheduler run failed", stderr.getvalue())
+        self.assertIn("Simulated scheduler failure", stderr.getvalue())
+        self.assertIn("Retry scheduler stopped", stdout.getvalue())
+
+    def test_invalid_options_are_rejected(self):
+        for options, expected_message in (
+            ({"interval": 0}, "--interval must be greater than zero."),
+            ({"batch_size": 0}, "--batch-size must be greater than zero."),
+            (
+                {"stale_after_seconds": 0},
+                "--stale-after-seconds must be greater than zero.",
+            ),
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesMessage(
+                    Exception, expected_message
+                ):
+                    call_command("run_delivery_retry_scheduler", **options)

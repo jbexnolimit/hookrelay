@@ -152,6 +152,7 @@ class Command(BaseCommand):
                     status=Delivery.Status.PROCESSING,
                 ).update(
                     status=Delivery.Status.QUEUED,
+                    next_retry_at=timezone.now() + timedelta(seconds=30),
                     updated_at=timezone.now(),
                 )
 

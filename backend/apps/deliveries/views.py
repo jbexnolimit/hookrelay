@@ -1,20 +1,24 @@
+import logging
+
+from django.db import transaction
+from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
-from .retry import schedule_retry
 
-from django.db import transaction
-from django.utils import timezone
-
+from apps.events.services import publish_delivery_task
 
 from .models import Delivery, DeliveryAttempt
+from .retry import schedule_retry
 from .serializers import (
     DeliveryAttemptSerializer,
     DeliveryResultInputSerializer,
     DeliverySerializer,
 )
+
+logger = logging.getLogger(__name__)
 
 class DeliveryViewSet(
     mixins.ListModelMixin,
@@ -52,6 +56,70 @@ class DeliveryViewSet(
                 queryset = queryset.filter(**{field: parsed})
 
         return queryset
+
+    @action(detail=True, methods=["post"], url_path="retry")
+    def retry(self, request, pk=None):
+        """Manually retry a failed delivery through Kafka."""
+        delivery = self.get_object()
+
+        with transaction.atomic():
+            delivery = (
+                Delivery.objects.select_for_update()
+                .select_related("event", "endpoint")
+                .get(pk=delivery.pk)
+            )
+
+            if delivery.status != Delivery.Status.FAILED:
+                return Response(
+                    {"message": "Only failed deliveries can be retried."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            delivery.status = Delivery.Status.PROCESSING
+            delivery.next_retry_at = None
+            delivery.last_error = ""
+            delivery.save(
+                update_fields=[
+                    "status",
+                    "next_retry_at",
+                    "last_error",
+                    "updated_at",
+                ]
+            )
+
+        try:
+            publish_delivery_task(delivery)
+        except Exception:
+            logger.exception(
+                "Failed to publish manual retry for delivery_id=%s",
+                delivery.pk,
+            )
+            error_message = "Manual retry could not be published."
+
+            Delivery.objects.filter(
+                pk=delivery.pk,
+                status=Delivery.Status.PROCESSING,
+            ).update(
+                status=Delivery.Status.FAILED,
+                next_retry_at=None,
+                last_error=error_message,
+                updated_at=timezone.now(),
+            )
+
+            return Response(
+                {"message": error_message},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        delivery.refresh_from_db()
+
+        return Response(
+            {
+                "message": "Manual retry published successfully.",
+                "delivery": DeliverySerializer(delivery).data,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
 
     @action(detail=True, methods=["get"], url_path="attempts")
     def attempts(self, request, pk=None):

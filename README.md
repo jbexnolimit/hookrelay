@@ -200,6 +200,24 @@ The worker connects to Kafka, consumes delivery tasks, sends HTTP requests to we
 | GET | `/api/analytics/` | View delivery analytics |
 | POST | `/api/dev/receiver/success/` | Successful demo receiver |
 | POST | `/api/dev/receiver/fail/` | Failing demo receiver |
+| POST | `/api/dev/receiver/recover/` | Receiver that fails temporarily, then succeeds |
+
+### Demo receivers
+
+Create or update the demo webhook endpoints after applying database migrations:
+
+```bash
+cd backend
+python manage.py seed_demo
+```
+
+This command configures three demo endpoints:
+
+- **Inventory Demo Receiver:** returns HTTP 200 for `order.created` events.
+- **Failure Demo Receiver:** returns HTTP 500 for `payment.failed` events.
+- **Recovery Demo Receiver:** returns HTTP 500 for its first two requests by default, then HTTP 200.
+
+The recovery receiver's failure threshold is configurable through Django admin. The demo receiver routes are intended for development and are only included when Django `DEBUG` is enabled.
 
 ### Example: Submit an event
 
@@ -282,7 +300,16 @@ python manage.py process_delivery_retries \
   --stale-after-seconds 300
 ```
 
-The scheduler can also be configured to run every minute through cron.
+For continuous processing during development, run the scheduler in a separate terminal:
+
+```bash
+cd ~/projects/hookrelay/backend
+python manage.py run_delivery_retry_scheduler --interval 10
+```
+
+It checks for due retries every 10 seconds by default. Press `Ctrl+C` to stop it. You can adjust the interval with `--interval`, and configure the batch size and stale-delivery timeout with `--batch-size` and `--stale-after-seconds`.
+
+For a scheduled alternative, the scheduler can also be configured to run every minute through cron.
 
 Create its log directory:
 

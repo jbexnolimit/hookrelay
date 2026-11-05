@@ -1,6 +1,10 @@
 from django.urls import path
 
-from .views import FailureReceiverView, SuccessReceiverView
+from .views import (
+    FailureReceiverView,
+    RecoveryReceiverView,
+    SuccessReceiverView,
+)
 
 
 urlpatterns = [
@@ -13,5 +17,10 @@ urlpatterns = [
         "receiver/fail/",
         FailureReceiverView.as_view(),
         name="dev-receiver-fail",
+    ),
+    path(
+        "receiver/recover/",
+        RecoveryReceiverView.as_view(),
+        name="dev-receiver-recover",
     ),
 ]
