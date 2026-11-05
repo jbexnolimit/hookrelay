@@ -264,6 +264,25 @@ Delivery records include:
 8. Django updates the delivery status and records the attempt.
 9. The worker commits the Kafka message after processing.
 
+### Outgoing delivery idempotency
+
+Each outgoing webhook request includes an `Idempotency-Key` HTTP header
+with the format `hookrelay-delivery-{delivery_id}`. The key identifies the
+logical delivery, so retries and Kafka replays of that delivery reuse the
+same key.
+
+Webhook receivers that need duplicate protection should persist and enforce
+this key atomically with the business operation it protects. Repeated
+requests with the same key should not repeat an already-applied operation.
+The receiver should define how it handles repeated keys with different
+request payloads and how long it retains idempotency records.
+
+The key alone does not guarantee exactly-once processing. HookRelay uses
+at-least-once delivery behavior, so a receiver may receive a request again
+if the worker or network fails before the result is recorded. Each reported
+delivery attempt has its own `attempt_id`; this is distinct from the stable
+idempotency key for the logical delivery.
+
 ## Retry Handling
 
 HookRelay automatically retries eligible failed deliveries.
