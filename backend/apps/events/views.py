@@ -1,4 +1,9 @@
+import logging
+import uuid
+from datetime import timedelta
+
 from django.db import transaction
+from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
@@ -9,7 +14,6 @@ from apps.deliveries.serializers import DeliverySerializer
 from apps.webhooks.models import WebhookEndpoint
 from .models import Event
 from .serializers import EventSerializer
-import logging
 
 from apps.events.services import publish_delivery_task
 
@@ -107,16 +111,42 @@ class EventViewSet(
         publish_failures = []
 
         for delivery in deliveries:
+            claim_token = uuid.uuid4()
+            delivery.status = Delivery.Status.PROCESSING
+            delivery.claim_token = claim_token
+            delivery.save(
+                update_fields=["status", "claim_token", "updated_at"]
+            )
+
             try:
                 publish_delivery_task(delivery)
             except Exception:
-                # Keep the saved delivery queued; don't lose the database record.
+                # Only roll back this claim if it is still current.
+                Delivery.objects.filter(
+                    pk=delivery.pk,
+                    status=Delivery.Status.PROCESSING,
+                    claim_token=claim_token,
+                ).update(
+                    status=Delivery.Status.QUEUED,
+                    claim_token=None,
+                    next_retry_at=timezone.now() + timedelta(seconds=30),
+                    updated_at=timezone.now(),
+                )
                 publish_failures.append(delivery.pk)
 
                 logger.exception(
                     "Could not publish delivery_id=%s to Kafka",
                     delivery.pk,
                 )
+
+            delivery.refresh_from_db()
+
+        deliveries = list(
+            Delivery.objects.filter(event=event).select_related(
+                "event",
+                "endpoint",
+            )
+        )
 
         response_data = self._response_data(
             event,
@@ -125,8 +155,10 @@ class EventViewSet(
 
         if publish_failures:
             response_data["message"] = (
-                "Event saved, but some delivery tasks could not be "
-                "published to Kafka. Those deliveries remain queued."
+                "Event saved, but one or more delivery publish operations "
+                "failed. The API preserved any newer delivery claims; "
+                "deliveries successfully reverted to QUEUED are eligible "
+                "for retry."
             )
             response_data["kafka_publish_failures"] = publish_failures
         elif deliveries:

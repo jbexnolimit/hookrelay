@@ -42,6 +42,7 @@ def publish_delivery_task(delivery):
 
     task = {
         "delivery_id": delivery.pk,
+        "claim_token": str(delivery.claim_token),
         "event_id": delivery.event_id,
         "event_type": delivery.event.event_type,
         "payload": delivery.event.payload,

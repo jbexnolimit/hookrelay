@@ -283,6 +283,20 @@ if the worker or network fails before the result is recorded. Each reported
 delivery attempt has its own `attempt_id`; this is distinct from the stable
 idempotency key for the logical delivery.
 
+### Claim-token protection
+
+Each published delivery task carries a unique claim token. The Rust worker
+returns that token with its result callback, and Django accepts the callback
+only when the token matches the delivery's current claim and the delivery is
+still processing. Callbacks from obsolete claims are acknowledged but ignored,
+so an old worker cannot overwrite a newer delivery state.
+
+Publishing-failure handlers also check the claim token before reverting a
+delivery. Stale-delivery recovery clears the old token before the delivery is
+claimed again. This protects database state from stale workers, but it cannot
+cancel an HTTP request that is already in flight; receiver-side idempotency
+remains important.
+
 ## Retry Handling
 
 HookRelay automatically retries eligible failed deliveries.

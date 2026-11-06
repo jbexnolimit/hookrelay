@@ -50,8 +50,8 @@ class DeliverySerializer(serializers.ModelSerializer):
 
 class DeliveryResultInputSerializer(serializers.Serializer):
     success = serializers.BooleanField()
-
     attempt_id = serializers.UUIDField(required=True)
+    claim_token = serializers.UUIDField(required=True)
     http_status_code = serializers.IntegerField(
         required=False,
         allow_null=True,

@@ -1,4 +1,5 @@
 import logging
+import uuid
 from datetime import timedelta
 
 from django.core.management.base import BaseCommand
@@ -44,7 +45,7 @@ class Command(BaseCommand):
         now = timezone.now()
         stale_before = now - timedelta(seconds=stale_seconds)
 
-                # Recover old queued deliveries that have no retry timestamp.
+        # Recover old queued deliveries that have no retry timestamp.
         # These may have been left behind without a published Kafka task.
         stale_queued = Delivery.objects.filter(
             status=Delivery.Status.QUEUED,
@@ -64,6 +65,7 @@ class Command(BaseCommand):
         ).update(
             status=Delivery.Status.FAILED,
             next_retry_at=None,
+            claim_token=None,
             last_error="Queued delivery exceeded maximum attempts.",
             updated_at=now,
         )
@@ -87,6 +89,7 @@ class Command(BaseCommand):
         ).update(
             status=Delivery.Status.QUEUED,
             next_retry_at=now,
+            claim_token=None,
             last_error="Recovered stale processing delivery.",
             updated_at=now,
         )
@@ -96,6 +99,7 @@ class Command(BaseCommand):
         ).update(
             status=Delivery.Status.FAILED,
             next_retry_at=None,
+            claim_token=None,
             last_error="Processing timed out after maximum attempts.",
             updated_at=now,
         )
@@ -136,8 +140,16 @@ class Command(BaseCommand):
                 if delivery is None:
                     continue
 
+                claim_token = uuid.uuid4()
                 delivery.status = Delivery.Status.PROCESSING
-                delivery.save(update_fields=["status", "updated_at"])
+                delivery.claim_token = claim_token
+                delivery.save(
+                    update_fields=[
+                        "status",
+                        "claim_token",
+                        "updated_at",
+                    ]
+                )
 
             try:
                 publish_delivery_task(delivery)
@@ -150,8 +162,10 @@ class Command(BaseCommand):
                 Delivery.objects.filter(
                     pk=delivery_id,
                     status=Delivery.Status.PROCESSING,
+                    claim_token=claim_token,
                 ).update(
                     status=Delivery.Status.QUEUED,
+                    claim_token=None,
                     next_retry_at=timezone.now() + timedelta(seconds=30),
                     updated_at=timezone.now(),
                 )

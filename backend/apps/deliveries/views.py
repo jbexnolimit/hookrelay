@@ -1,4 +1,5 @@
 import logging
+import uuid
 
 from django.db import transaction
 from django.utils import timezone
@@ -75,12 +76,15 @@ class DeliveryViewSet(
                     status=status.HTTP_409_CONFLICT,
                 )
 
+            claim_token = uuid.uuid4()
             delivery.status = Delivery.Status.PROCESSING
+            delivery.claim_token = claim_token
             delivery.next_retry_at = None
             delivery.last_error = ""
             delivery.save(
                 update_fields=[
                     "status",
+                    "claim_token",
                     "next_retry_at",
                     "last_error",
                     "updated_at",
@@ -99,8 +103,10 @@ class DeliveryViewSet(
             Delivery.objects.filter(
                 pk=delivery.pk,
                 status=Delivery.Status.PROCESSING,
+                claim_token=claim_token,
             ).update(
                 status=Delivery.Status.FAILED,
+                claim_token=None,
                 next_retry_at=None,
                 last_error=error_message,
                 updated_at=timezone.now(),
@@ -184,6 +190,22 @@ class DeliveryViewSet(
                     status=status.HTTP_200_OK,
                 )
 
+            if (
+                delivery.status != Delivery.Status.PROCESSING
+                or delivery.claim_token != result_data["claim_token"]
+            ):
+                return Response(
+                    {
+                        "message": (
+                            "Delivery claim is no longer current; "
+                            "callback ignored."
+                        ),
+                        "delivery": DeliverySerializer(delivery).data,
+                        "attempt": None,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
             now = timezone.now()
             attempt_number = delivery.attempt_count + 1
             succeeded = result_data["success"]
@@ -231,6 +253,7 @@ class DeliveryViewSet(
                     result_data.get("http_status_code"),
                 )
 
+            delivery.claim_token = None
             delivery.save(
                 update_fields=[
                     "attempt_count",
@@ -240,6 +263,7 @@ class DeliveryViewSet(
                     "status",
                     "delivered_at",
                     "next_retry_at",
+                    "claim_token",
                     "updated_at",
                 ]
             )

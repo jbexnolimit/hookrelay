@@ -138,6 +138,7 @@ class DeliveryRetryCommandTests(TestCase):
             self.delivery.status,
             Delivery.Status.PROCESSING,
         )
+        self.assertIsNotNone(self.delivery.claim_token)
 
     @patch(
         "apps.deliveries.management.commands.process_delivery_retries."
@@ -152,6 +153,7 @@ class DeliveryRetryCommandTests(TestCase):
         self.delivery.refresh_from_db()
         publish_mock.assert_called_once()
         self.assertEqual(self.delivery.status, Delivery.Status.QUEUED)
+        self.assertIsNone(self.delivery.claim_token)
         self.assertIsNotNone(self.delivery.next_retry_at)
         self.assertGreater(
             self.delivery.next_retry_at,
@@ -280,6 +282,7 @@ class DeliveryResultCallbackTests(TestCase):
             status=Delivery.Status.PROCESSING,
             attempt_count=0,
             max_attempts=5,
+            claim_token=uuid.uuid4(),
         )
 
         self.url = f"/api/deliveries/{self.delivery.pk}/result/"
@@ -288,6 +291,7 @@ class DeliveryResultCallbackTests(TestCase):
         attempt_id = str(uuid.uuid4())
         payload = {
             "attempt_id": attempt_id,
+            "claim_token": str(self.delivery.claim_token),
             "success": True,
             "http_status_code": 201,
             "response_time_ms": 25,
@@ -322,6 +326,38 @@ class DeliveryResultCallbackTests(TestCase):
             1,
         )
 
+    def test_stale_claim_callback_is_ignored(self):
+        current_token = self.delivery.claim_token
+        stale_token = uuid.uuid4()
+        self.assertNotEqual(stale_token, current_token)
+
+        response = self.client.post(
+            self.url,
+            {
+                "attempt_id": str(uuid.uuid4()),
+                "claim_token": str(stale_token),
+                "success": True,
+                "http_status_code": 201,
+                "response_time_ms": 25,
+                "response_body": "",
+                "error_message": "",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data["attempt"])
+        self.assertIn("claim is no longer current", response.data["message"])
+
+        self.delivery.refresh_from_db()
+        self.assertEqual(self.delivery.status, Delivery.Status.PROCESSING)
+        self.assertEqual(self.delivery.attempt_count, 0)
+        self.assertEqual(self.delivery.claim_token, current_token)
+        self.assertEqual(
+            DeliveryAttempt.objects.filter(delivery=self.delivery).count(),
+            0,
+        )
+
     def test_late_callback_does_not_change_failed_delivery(self):
         self.delivery.status = Delivery.Status.FAILED
         self.delivery.attempt_count = 5
@@ -333,6 +369,7 @@ class DeliveryResultCallbackTests(TestCase):
             self.url,
             {
                 "attempt_id": str(uuid.uuid4()),
+                "claim_token": str(self.delivery.claim_token),
                 "success": True,
                 "http_status_code": 201,
                 "response_time_ms": 25,
@@ -399,6 +436,7 @@ class ManualDeliveryRetryTests(TestCase):
         self.assertEqual(self.delivery.attempt_count, 5)
         self.assertIsNone(self.delivery.next_retry_at)
         self.assertEqual(self.delivery.last_error, "")
+        self.assertIsNotNone(self.delivery.claim_token)
 
     @patch("apps.deliveries.views.publish_delivery_task")
     def test_non_failed_delivery_cannot_be_retried(self, publish_mock):
@@ -436,6 +474,7 @@ class ManualDeliveryRetryTests(TestCase):
             self.delivery.last_error,
             "Manual retry could not be published.",
         )
+        self.assertIsNone(self.delivery.claim_token)
         self.assertEqual(self.delivery.attempt_count, 5)
 
 

@@ -49,6 +49,7 @@ pub async fn process_delivery(client: &Client, config: &Config, task: &DeliveryT
 
             DeliveryResult {
                 attempt_id,
+                claim_token: task.claim_token,
                 success,
                 http_status_code: Some(status.as_u16()),
                 response_time_ms: started.elapsed().as_millis() as u64,
@@ -62,6 +63,7 @@ pub async fn process_delivery(client: &Client, config: &Config, task: &DeliveryT
         }
         Err(error) => DeliveryResult {
             attempt_id,
+            claim_token: task.claim_token,
             success: false,
             http_status_code: None,
             response_time_ms: started.elapsed().as_millis() as u64,
@@ -210,6 +212,7 @@ mod tests {
 
         let task = DeliveryTask {
             delivery_id: 42,
+            claim_token: uuid::Uuid::new_v4(),
             event_id: 7,
             event_type: "order.created".to_string(),
             payload: json!({"order_id": "ORD-1001"}),

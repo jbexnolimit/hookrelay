@@ -32,6 +32,11 @@ class Delivery(models.Model):
     max_attempts = models.PositiveIntegerField(default=5)
 
     next_retry_at = models.DateTimeField(null=True, blank=True)
+    claim_token = models.UUIDField(
+        null=True,
+        blank=True,
+        editable=False,
+    )
     last_attempt_at = models.DateTimeField(null=True, blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
 
