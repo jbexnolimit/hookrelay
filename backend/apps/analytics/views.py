@@ -51,9 +51,25 @@ class DeliveryActivityView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
+        raw_days = request.query_params.get("days", "7")
+
+        try:
+            requested_days = int(raw_days)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "days must be one of: 7, 14, 30."},
+                status=400,
+            )
+
+        if requested_days not in (7, 14, 30):
+            return Response(
+                {"detail": "days must be one of: 7, 14, 30."},
+                status=400,
+            )
+
         current_tz = timezone.get_current_timezone()
         today = timezone.localdate()
-        start_date = today - timedelta(days=6)
+        start_date = today - timedelta(days=requested_days - 1)
 
         start_at = timezone.make_aware(
             datetime.combine(start_date, time.min),
@@ -85,7 +101,7 @@ class DeliveryActivityView(APIView):
 
         days = []
 
-        for offset in range(7):
+        for offset in range(requested_days):
             day = start_date + timedelta(days=offset)
             date_key = day.isoformat()
             counts = daily_counts.get(date_key, {})

@@ -129,20 +129,37 @@ class DeliveryActivityTests(TestCase):
 
         return delivery
 
-    def get_activity(self):
-        request = self.factory.get(self.url)
+    def get_activity(self, days=None):
+        query = {} if days is None else {"days": days}
+        request = self.factory.get(self.url, query)
         response = DeliveryActivityView.as_view()(request)
-        self.assertEqual(response.status_code, 200)
-        return response.data
+        return response
 
     def test_activity_returns_seven_days(self):
-        activity = self.get_activity()
+        response = self.get_activity()
 
-        self.assertEqual(len(activity["days"]), 7)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["days"]), 7)
         self.assertEqual(
-            [day["date"] for day in activity["days"]],
-            sorted(day["date"] for day in activity["days"]),
+            [day["date"] for day in response.data["days"]],
+            sorted(day["date"] for day in response.data["days"]),
         )
+
+    def test_activity_supports_fourteen_and_thirty_days(self):
+        for requested_days in (14, 30):
+            with self.subTest(days=requested_days):
+                response = self.get_activity(days=requested_days)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(len(response.data["days"]), requested_days)
+
+    def test_activity_rejects_unsupported_day_ranges(self):
+        for requested_days in ("0", "8", "90", "invalid"):
+            with self.subTest(days=requested_days):
+                response = self.get_activity(days=requested_days)
+
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("detail", response.data)
 
     def test_activity_counts_deliveries_by_current_status(self):
         self.create_delivery(
@@ -162,10 +179,11 @@ class DeliveryActivityTests(TestCase):
             Delivery.Status.PROCESSING,
         )
 
-        activity = self.get_activity()
+        response = self.get_activity()
+        self.assertEqual(response.status_code, 200)
         today = timezone.localdate().isoformat()
         today_data = next(
-            day for day in activity["days"]
+            day for day in response.data["days"]
             if day["date"] == today
         )
 
@@ -175,9 +193,10 @@ class DeliveryActivityTests(TestCase):
         self.assertEqual(today_data["processing"], 1)
 
     def test_activity_uses_zero_counts_for_empty_days(self):
-        activity = self.get_activity()
+        response = self.get_activity()
+        self.assertEqual(response.status_code, 200)
 
-        for day in activity["days"]:
+        for day in response.data["days"]:
             self.assertEqual(day["queued"], 0)
             self.assertEqual(day["processing"], 0)
             self.assertEqual(day["delivered"], 0)
@@ -190,8 +209,9 @@ class DeliveryActivityTests(TestCase):
             days_ago=7,
         )
 
-        activity = self.get_activity()
+        response = self.get_activity()
+        self.assertEqual(response.status_code, 200)
 
         self.assertTrue(
-            all(day["delivered"] == 0 for day in activity["days"])
+            all(day["delivered"] == 0 for day in response.data["days"])
         )
