@@ -9,12 +9,13 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
-from apps.events.services import publish_delivery_task
+from .outbox import enqueue_delivery_task
 
 from .models import Delivery, DeliveryAttempt
 from .retry import schedule_retry
 from .serializers import (
     DeliveryAttemptSerializer,
+    DeliveryHeartbeatInputSerializer,
     DeliveryResultInputSerializer,
     DeliverySerializer,
 )
@@ -60,7 +61,7 @@ class DeliveryViewSet(
 
     @action(detail=True, methods=["post"], url_path="retry")
     def retry(self, request, pk=None):
-        """Manually retry a failed delivery through Kafka."""
+        """Queue a failed delivery for publication through the outbox."""
         delivery = self.get_object()
 
         with transaction.atomic():
@@ -79,52 +80,64 @@ class DeliveryViewSet(
             claim_token = uuid.uuid4()
             delivery.status = Delivery.Status.PROCESSING
             delivery.claim_token = claim_token
+            delivery.worker_heartbeat_at = timezone.now()
             delivery.next_retry_at = None
             delivery.last_error = ""
             delivery.save(
                 update_fields=[
                     "status",
                     "claim_token",
+                    "worker_heartbeat_at",
                     "next_retry_at",
                     "last_error",
                     "updated_at",
                 ]
             )
-
-        try:
-            publish_delivery_task(delivery)
-        except Exception:
-            logger.exception(
-                "Failed to publish manual retry for delivery_id=%s",
-                delivery.pk,
-            )
-            error_message = "Manual retry could not be published."
-
-            Delivery.objects.filter(
-                pk=delivery.pk,
-                status=Delivery.Status.PROCESSING,
-                claim_token=claim_token,
-            ).update(
-                status=Delivery.Status.FAILED,
-                claim_token=None,
-                next_retry_at=None,
-                last_error=error_message,
-                updated_at=timezone.now(),
-            )
-
-            return Response(
-                {"message": error_message},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
+            enqueue_delivery_task(delivery, claim_token)
 
         delivery.refresh_from_db()
 
         return Response(
             {
-                "message": "Manual retry published successfully.",
+                "message": "Manual retry queued for publication.",
                 "delivery": DeliverySerializer(delivery).data,
             },
             status=status.HTTP_202_ACCEPTED,
+        )
+
+    @action(detail=True, methods=["post"], url_path="heartbeat")
+    def heartbeat(self, request, pk=None):
+        """Refresh worker liveness only for the current processing claim."""
+        input_serializer = DeliveryHeartbeatInputSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        claim_token = input_serializer.validated_data["claim_token"]
+
+        with transaction.atomic():
+            delivery = Delivery.objects.select_for_update().get(
+                pk=self.get_object().pk
+            )
+
+            if (
+                delivery.status != Delivery.Status.PROCESSING
+                or delivery.claim_token != claim_token
+            ):
+                return Response(
+                    {
+                        "message": (
+                            "Delivery claim is no longer current; "
+                            "heartbeat ignored."
+                        ),
+                        "active": False,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            delivery.worker_heartbeat_at = timezone.now()
+            delivery.save(update_fields=["worker_heartbeat_at"])
+
+        return Response(
+            {"message": "Heartbeat recorded.", "active": True},
+            status=status.HTTP_200_OK,
         )
 
     @action(detail=True, methods=["get"], url_path="attempts")
@@ -254,6 +267,7 @@ class DeliveryViewSet(
                 )
 
             delivery.claim_token = None
+            delivery.worker_heartbeat_at = None
             delivery.save(
                 update_fields=[
                     "attempt_count",
@@ -264,6 +278,7 @@ class DeliveryViewSet(
                     "delivered_at",
                     "next_retry_at",
                     "claim_token",
+                    "worker_heartbeat_at",
                     "updated_at",
                 ]
             )

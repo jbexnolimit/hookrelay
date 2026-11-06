@@ -1,6 +1,4 @@
-import logging
 import uuid
-from datetime import timedelta
 
 from django.db import transaction
 from django.utils import timezone
@@ -10,14 +8,12 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from apps.deliveries.models import Delivery
+from apps.deliveries.outbox import enqueue_delivery_task
 from apps.deliveries.serializers import DeliverySerializer
 from apps.webhooks.models import WebhookEndpoint
+
 from .models import Event
 from .serializers import EventSerializer
-
-from apps.events.services import publish_delivery_task
-
-logger = logging.getLogger(__name__)
 
 
 class EventViewSet(
@@ -32,12 +28,7 @@ class EventViewSet(
     permission_classes = [AllowAny]  # Add authentication before production deployment.
     queryset = Event.objects.all()
 
-    def _response_data(
-        self,
-        event,
-        idempotent_replay=False,
-        deliveries=None,
-    ):
+    def _response_data(self, event, idempotent_replay=False, deliveries=None):
         if deliveries is None:
             deliveries = list(
                 Delivery.objects.filter(event=event).select_related(
@@ -46,15 +37,16 @@ class EventViewSet(
                 )
             )
 
-        has_deliveries = bool(deliveries)
-
         if idempotent_replay:
             message = (
                 "This idempotency key was already processed; "
                 "existing event returned."
             )
-        elif has_deliveries:
-            message = "Event saved and matching delivery records created."
+        elif deliveries:
+            message = (
+                f"Event saved and {len(deliveries)} delivery task(s) "
+                "queued for publication."
+            )
         else:
             message = (
                 "Event saved, but no active webhook endpoint "
@@ -100,75 +92,40 @@ class EventViewSet(
                 ]
             )
 
-        # The transaction has committed. Fetch real IDs and related objects.
+            # Persist each delivery's claim and publication intent together.
+            # If any outbox insert fails, the event and deliveries roll back too.
+            deliveries = list(
+                Delivery.objects.filter(event=event).select_related(
+                    "event",
+                    "endpoint",
+                )
+            )
+
+            for delivery in deliveries:
+                claim_token = uuid.uuid4()
+                delivery.status = Delivery.Status.PROCESSING
+                delivery.claim_token = claim_token
+                delivery.worker_heartbeat_at = timezone.now()
+                delivery.save(
+                    update_fields=[
+                        "status",
+                        "claim_token",
+                        "worker_heartbeat_at",
+                        "updated_at",
+                    ]
+                )
+                enqueue_delivery_task(delivery, claim_token)
+
+        # The transaction has committed. Read the final delivery state.
         deliveries = list(
             Delivery.objects.filter(event=event).select_related(
                 "event",
                 "endpoint",
             )
         )
-
-        publish_failures = []
-
-        for delivery in deliveries:
-            claim_token = uuid.uuid4()
-            delivery.status = Delivery.Status.PROCESSING
-            delivery.claim_token = claim_token
-            delivery.save(
-                update_fields=["status", "claim_token", "updated_at"]
-            )
-
-            try:
-                publish_delivery_task(delivery)
-            except Exception:
-                # Only roll back this claim if it is still current.
-                Delivery.objects.filter(
-                    pk=delivery.pk,
-                    status=Delivery.Status.PROCESSING,
-                    claim_token=claim_token,
-                ).update(
-                    status=Delivery.Status.QUEUED,
-                    claim_token=None,
-                    next_retry_at=timezone.now() + timedelta(seconds=30),
-                    updated_at=timezone.now(),
-                )
-                publish_failures.append(delivery.pk)
-
-                logger.exception(
-                    "Could not publish delivery_id=%s to Kafka",
-                    delivery.pk,
-                )
-
-            delivery.refresh_from_db()
-
-        deliveries = list(
-            Delivery.objects.filter(event=event).select_related(
-                "event",
-                "endpoint",
-            )
-        )
-
-        response_data = self._response_data(
-            event,
-            deliveries=deliveries,
-        )
-
-        if publish_failures:
-            response_data["message"] = (
-                "Event saved, but one or more delivery publish operations "
-                "failed. The API preserved any newer delivery claims; "
-                "deliveries successfully reverted to QUEUED are eligible "
-                "for retry."
-            )
-            response_data["kafka_publish_failures"] = publish_failures
-        elif deliveries:
-            response_data["message"] = (
-                f"Event saved and {len(deliveries)} delivery task(s) "
-                "published to Kafka."
-            )
 
         return Response(
-            response_data,
+            self._response_data(event, deliveries=deliveries),
             status=status.HTTP_201_CREATED,
         )
 

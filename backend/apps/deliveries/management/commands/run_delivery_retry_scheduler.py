@@ -5,20 +5,20 @@ from django.core.management.base import CommandError
 
 
 class Command(BaseCommand):
-    help = "Continuously process due webhook retries at a fixed interval."
+    help = "Continuously process retries and dispatch the delivery outbox."
 
     def add_arguments(self, parser):
         parser.add_argument(
             "--interval",
             type=float,
             default=10,
-            help="Seconds to wait between retry scheduler runs (default: 10).",
+            help="Seconds to wait between scheduler runs (default: 10).",
         )
         parser.add_argument(
             "--batch-size",
             type=int,
             default=100,
-            help="Maximum number of retries to process per run.",
+            help="Maximum number of retries and outbox entries per run.",
         )
         parser.add_argument(
             "--stale-after-seconds",
@@ -50,20 +50,31 @@ class Command(BaseCommand):
             )
         )
 
+        commands = (
+            (
+                "process_delivery_retries",
+                {
+                    "batch_size": batch_size,
+                    "stale_after_seconds": stale_after_seconds,
+                },
+            ),
+            (
+                "dispatch_outbox",
+                {"batch_size": batch_size},
+            ),
+        )
+
         try:
             while True:
-                try:
-                    call_command(
-                        "process_delivery_retries",
-                        batch_size=options["batch_size"],
-                        stale_after_seconds=options["stale_after_seconds"],
-                    )
-                except Exception as exc:
-                    self.stderr.write(
-                        self.style.ERROR(
-                            f"Retry scheduler run failed: {exc}"
+                for command_name, command_options in commands:
+                    try:
+                        call_command(command_name, **command_options)
+                    except Exception as exc:
+                        self.stderr.write(
+                            self.style.ERROR(
+                                f"{command_name} failed: {exc}"
+                            )
                         )
-                    )
 
                 time.sleep(interval)
         except KeyboardInterrupt:

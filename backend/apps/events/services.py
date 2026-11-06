@@ -1,11 +1,8 @@
 import json
-import logging
 import os
 import threading
 
 from kafka import KafkaProducer
-
-logger = logging.getLogger(__name__)
 
 _producer = None
 _producer_lock = threading.Lock()
@@ -31,39 +28,3 @@ def get_kafka_producer():
             )
 
     return _producer
-
-
-def publish_delivery_task(delivery):
-    """Publish a task built from a saved Delivery and its related records."""
-    topic = os.getenv(
-        "KAFKA_DELIVERY_TOPIC",
-        "hookrelay.delivery-tasks",
-    )
-
-    task = {
-        "delivery_id": delivery.pk,
-        "claim_token": str(delivery.claim_token),
-        "event_id": delivery.event_id,
-        "event_type": delivery.event.event_type,
-        "payload": delivery.event.payload,
-        "webhook_url": delivery.endpoint.url,
-    }
-
-    producer = get_kafka_producer()
-
-    # Wait for Kafka's acknowledgement before reporting success.
-    metadata = producer.send(
-        topic,
-        key=str(delivery.pk),
-        value=task,
-    ).get(timeout=15)
-
-    logger.info(
-        "Published delivery task: delivery_id=%s topic=%s partition=%s offset=%s",
-        delivery.pk,
-        metadata.topic,
-        metadata.partition,
-        metadata.offset,
-    )
-
-    return metadata

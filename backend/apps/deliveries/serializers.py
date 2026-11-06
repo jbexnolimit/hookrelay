@@ -48,6 +48,10 @@ class DeliverySerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+class DeliveryHeartbeatInputSerializer(serializers.Serializer):
+    claim_token = serializers.UUIDField(required=True)
+
+
 class DeliveryResultInputSerializer(serializers.Serializer):
     success = serializers.BooleanField()
     attempt_id = serializers.UUIDField(required=True)

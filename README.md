@@ -235,7 +235,7 @@ curl -X POST http://127.0.0.1:8001/api/events/ \
   }'
 ```
 
-The API stores the event, finds active webhook subscriptions matching its event type, creates delivery records, and publishes delivery tasks to Kafka.
+The API stores the event, finds active webhook subscriptions matching its event type, creates delivery records, and records delivery tasks in the PostgreSQL transactional outbox. The outbox dispatcher publishes those tasks to Kafka.
 
 ### View deliveries
 
@@ -257,12 +257,13 @@ Delivery records include:
 1. A client submits an event to the Django API.
 2. Django stores the event in PostgreSQL.
 3. Matching active webhook endpoints are identified based on their subscribed event types.
-4. Django creates delivery records and publishes tasks to Kafka.
-5. The Rust worker consumes the tasks.
-6. The worker sends HTTP POST requests to the target webhook endpoints.
-7. The worker reports the delivery result to Django.
-8. Django updates the delivery status and records the attempt.
-9. The worker commits the Kafka message after processing.
+4. Django creates delivery records and records pending delivery tasks in the transactional outbox within the same database transaction.
+5. The outbox dispatcher publishes pending tasks to Kafka after the database transaction commits.
+6. The Rust worker consumes the tasks.
+7. The worker sends HTTP POST requests to the target webhook endpoints.
+8. The worker reports the delivery result to Django.
+9. Django updates the delivery status and records the attempt.
+10. The worker commits the Kafka message after processing.
 
 ### Outgoing delivery idempotency
 
@@ -297,6 +298,26 @@ claimed again. This protects database state from stale workers, but it cannot
 cancel an HTTP request that is already in flight; receiver-side idempotency
 remains important.
 
+## Transactional Outbox
+
+HookRelay stores delivery-task publication intent in PostgreSQL before attempting
+to publish a task to Kafka. Event creation, delivery claim updates, and outbox
+creation occur in the same database transaction. Manual retries and scheduled
+retries use the same mechanism.
+
+The `dispatch_outbox` management command publishes pending outbox entries and
+waits for Kafka acknowledgement. Successful entries are marked as published.
+Failed publications remain pending and are rescheduled with exponential
+backoff. A dispatch lease allows abandoned entries to become eligible for
+another attempt if a dispatcher process stops unexpectedly.
+
+The outbox closes the gap where a database transaction could commit but its
+Kafka publication intent could be lost. It does not provide exactly-once
+delivery: a process may publish a message and stop before recording the
+acknowledgement in PostgreSQL, causing the message to be published again.
+Claim tokens protect delivery state from obsolete callbacks, and receiver-side
+idempotency is still recommended.
+
 ## Retry Handling
 
 HookRelay automatically retries eligible failed deliveries.
@@ -321,7 +342,7 @@ The system allows up to 5 total delivery attempts.
 
 ### Retry scheduler
 
-The Django management command identifies deliveries that are due for retry and republishes their tasks to Kafka. It also recovers stale deliveries that were interrupted while queued or processing.
+The `process_delivery_retries` command identifies deliveries due for retry, records new delivery claims in the outbox, and recovers stale deliveries interrupted while queued or processing. The separate `dispatch_outbox` command publishes pending outbox entries to Kafka.
 
 Run manually:
 
@@ -333,16 +354,23 @@ python manage.py process_delivery_retries \
   --stale-after-seconds 300
 ```
 
-For continuous processing during development, run the scheduler in a separate terminal:
+For continuous retry processing and outbox publication during development, run the combined scheduler in a separate terminal:
 
 ```bash
 cd ~/projects/hookrelay/backend
 python manage.py run_delivery_retry_scheduler --interval 10
 ```
 
-It checks for due retries every 10 seconds by default. Press `Ctrl+C` to stop it. You can adjust the interval with `--interval`, and configure the batch size and stale-delivery timeout with `--batch-size` and `--stale-after-seconds`.
+Each cycle runs `process_delivery_retries` and `dispatch_outbox` independently. If one command fails, the other is still attempted. The scheduler checks every 10 seconds by default. Press `Ctrl+C` to stop it. Adjust the interval with `--interval`, the batch size with `--batch-size`, and the stale-delivery timeout with `--stale-after-seconds`.
 
-For a scheduled alternative, the scheduler can also be configured to run every minute through cron.
+You can also run either command manually:
+
+```bash
+python manage.py dispatch_outbox --batch-size 100
+python manage.py process_delivery_retries --batch-size 100 --stale-after-seconds 300
+```
+
+For a cron-based alternative, run both commands periodically. Use a semicolon between them so outbox dispatch is still attempted if retry processing fails.
 
 Create its log directory:
 
@@ -353,7 +381,7 @@ mkdir -p ~/.local/state/hookrelay
 Add this to your crontab using `crontab -e`:
 
 ```cron
-* * * * * /usr/bin/flock -n /tmp/hookrelay-retry-scheduler.lock /bin/bash -lc 'cd "$HOME/projects/hookrelay/backend" && "$HOME/projects/hookrelay/.venv/bin/python" manage.py process_delivery_retries --batch-size 100 --stale-after-seconds 300' >> "$HOME/.local/state/hookrelay/retry-scheduler.log" 2>&1
+* * * * * /usr/bin/flock -n /tmp/hookrelay-outbox-scheduler.lock /bin/bash -lc 'cd "$HOME/projects/hookrelay/backend"; "$HOME/projects/hookrelay/.venv/bin/python" manage.py process_delivery_retries --batch-size 100 --stale-after-seconds 300; "$HOME/projects/hookrelay/.venv/bin/python" manage.py dispatch_outbox --batch-size 100' >> "$HOME/.local/state/hookrelay/retry-scheduler.log" 2>&1
 ```
 
 View scheduler logs:
@@ -379,7 +407,8 @@ The delivery test suite covers:
 - Retry eligibility and scheduling
 - Permanent failure handling
 - Stale delivery recovery
-- Kafka publishing failures
+- Kafka publication failures and outbox retries
+- Transactional outbox creation and dispatch
 - Callback idempotency
 - Late delivery callbacks
 
@@ -468,5 +497,5 @@ Also confirm that the Django API is running and accessible at `http://127.0.0.1:
 
 - Docker Compose manages PostgreSQL and Kafka; Django and the Rust worker run locally during development.
 - PostgreSQL and Kafka data are persisted using Docker named volumes.
-- The retry scheduler runs separately from the Django API and Rust worker.
+- The retry scheduler runs separately from the Django API and Rust worker; it also dispatches pending outbox entries.
 - Local development configuration is intended for testing and development, not production deployment.

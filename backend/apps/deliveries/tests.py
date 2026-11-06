@@ -2,13 +2,13 @@ from datetime import timedelta
 from types import SimpleNamespace
 from django.test import SimpleTestCase
 from django.utils import timezone
-from apps.deliveries.models import Delivery, DeliveryAttempt
+from apps.deliveries.models import Delivery, DeliveryAttempt, OutboxMessage
 from apps.deliveries.retry import (
     RETRY_DELAYS_SECONDS,
     is_retryable_failure,
     schedule_retry,
 )
-from unittest.mock import patch
+from unittest.mock import patch, call
 from django.core.management import call_command
 from django.test import TestCase
 from apps.events.models import Event
@@ -125,66 +125,53 @@ class DeliveryRetryCommandTests(TestCase):
             next_retry_at=timezone.now() - timedelta(seconds=1),
         )
 
-    @patch(
-        "apps.deliveries.management.commands.process_delivery_retries."
-        "publish_delivery_task"
-    )
-    def test_due_retry_is_published_and_claimed(self, publish_mock):
-        call_command("process_delivery_retries")
+    def run_processor(self, **options):
+        defaults = {"stale_after_seconds": 300}
+        defaults.update(options)
+        call_command("process_delivery_retries", **defaults)
+
+    def test_due_retry_is_queued_and_claimed(self):
+        self.run_processor()
 
         self.delivery.refresh_from_db()
-        publish_mock.assert_called_once()
         self.assertEqual(
             self.delivery.status,
             Delivery.Status.PROCESSING,
         )
         self.assertIsNotNone(self.delivery.claim_token)
 
-    @patch(
-        "apps.deliveries.management.commands.process_delivery_retries."
-        "publish_delivery_task",
-        side_effect=RuntimeError("Kafka unavailable"),
-    )
-    def test_publish_failure_restores_queued_status(self, publish_mock):
-        before = timezone.now()
+        outbox = OutboxMessage.objects.get(delivery=self.delivery)
+        self.assertEqual(outbox.status, OutboxMessage.Status.PENDING)
+        self.assertEqual(outbox.claim_token, self.delivery.claim_token)
+        self.assertEqual(
+            outbox.task_payload["delivery_id"],
+            self.delivery.pk,
+        )
 
-        call_command("process_delivery_retries")
+    def test_outbox_creation_failure_rolls_back_retry_claim(self):
+        with patch(
+            "apps.deliveries.management.commands.process_delivery_retries."
+            "enqueue_delivery_task",
+            side_effect=RuntimeError("Database unavailable"),
+        ):
+            self.run_processor()
 
         self.delivery.refresh_from_db()
-        publish_mock.assert_called_once()
         self.assertEqual(self.delivery.status, Delivery.Status.QUEUED)
         self.assertIsNone(self.delivery.claim_token)
-        self.assertIsNotNone(self.delivery.next_retry_at)
-        self.assertGreater(
-            self.delivery.next_retry_at,
-            before + timedelta(seconds=29),
-        )
-        self.assertLessEqual(
-            self.delivery.next_retry_at,
-            timezone.now() + timedelta(seconds=30),
-        )
+        self.assertEqual(OutboxMessage.objects.count(), 0)
 
-    @patch(
-        "apps.deliveries.management.commands.process_delivery_retries."
-        "publish_delivery_task"
-    )
-    def test_future_retry_is_not_published(self, publish_mock):
+    def test_future_retry_is_not_queued(self):
         self.delivery.next_retry_at = timezone.now() + timedelta(hours=1)
         self.delivery.save(update_fields=["next_retry_at"])
 
-        call_command("process_delivery_retries")
+        self.run_processor()
 
-        publish_mock.assert_not_called()
         self.delivery.refresh_from_db()
         self.assertEqual(self.delivery.status, Delivery.Status.QUEUED)
+        self.assertEqual(OutboxMessage.objects.count(), 0)
 
-    @patch(
-        "apps.deliveries.management.commands.process_delivery_retries."
-        "publish_delivery_task"
-    )
-    def test_stale_queued_delivery_without_retry_time_is_recovered(
-        self, publish_mock
-    ):
+    def test_stale_queued_delivery_without_retry_time_is_recovered(self):
         self.delivery.next_retry_at = None
         self.delivery.save(update_fields=["next_retry_at"])
 
@@ -192,24 +179,21 @@ class DeliveryRetryCommandTests(TestCase):
             updated_at=timezone.now() - timedelta(minutes=10)
         )
 
-        call_command(
-            "process_delivery_retries",
-            stale_after_seconds=300,
-        )
+        self.run_processor()
 
         self.delivery.refresh_from_db()
-        publish_mock.assert_called_once()
         self.assertEqual(
             self.delivery.status,
             Delivery.Status.PROCESSING,
         )
         self.assertEqual(self.delivery.attempt_count, 1)
+        self.assertIsNotNone(self.delivery.claim_token)
+        self.assertEqual(
+            OutboxMessage.objects.get(delivery=self.delivery).status,
+            OutboxMessage.Status.PENDING,
+        )
 
-    @patch(
-        "apps.deliveries.management.commands.process_delivery_retries."
-        "publish_delivery_task"
-    )
-    def test_stale_processing_delivery_is_recovered(self, publish_mock):
+    def test_stale_processing_delivery_is_recovered(self):
         self.delivery.status = Delivery.Status.PROCESSING
         self.delivery.save(update_fields=["status"])
 
@@ -217,25 +201,108 @@ class DeliveryRetryCommandTests(TestCase):
             updated_at=timezone.now() - timedelta(minutes=10)
         )
 
-        call_command(
-            "process_delivery_retries",
-            stale_after_seconds=300,
-        )
+        self.run_processor()
 
         self.delivery.refresh_from_db()
-        publish_mock.assert_called_once()
         self.assertEqual(
             self.delivery.status,
             Delivery.Status.PROCESSING,
         )
-        self.assertEqual(self.delivery.last_error,
-                         "Recovered stale processing delivery.")
+        self.assertEqual(
+            self.delivery.last_error,
+            "Recovered stale processing delivery.",
+        )
+        self.assertIsNotNone(self.delivery.claim_token)
+        self.assertEqual(
+            OutboxMessage.objects.get(delivery=self.delivery).status,
+            OutboxMessage.Status.PENDING,
+        )
 
-    @patch(
-        "apps.deliveries.management.commands.process_delivery_retries."
-        "publish_delivery_task"
-    )
-    def test_stale_delivery_at_attempt_limit_is_failed(self, publish_mock):
+    def test_fresh_heartbeat_prevents_recovery_when_updated_at_is_old(self):
+        token = uuid.uuid4()
+        self.delivery.status = Delivery.Status.PROCESSING
+        self.delivery.claim_token = token
+        self.delivery.worker_heartbeat_at = timezone.now()
+        self.delivery.save(
+            update_fields=[
+                "status",
+                "claim_token",
+                "worker_heartbeat_at",
+            ]
+        )
+
+        Delivery.objects.filter(pk=self.delivery.pk).update(
+            updated_at=timezone.now() - timedelta(minutes=10)
+        )
+
+        self.run_processor()
+
+        self.delivery.refresh_from_db()
+        self.assertEqual(self.delivery.status, Delivery.Status.PROCESSING)
+        self.assertEqual(self.delivery.claim_token, token)
+        self.assertEqual(OutboxMessage.objects.count(), 0)
+
+    def test_stale_heartbeat_triggers_recovery_when_updated_at_is_recent(self):
+        token = uuid.uuid4()
+        self.delivery.status = Delivery.Status.PROCESSING
+        self.delivery.claim_token = token
+        self.delivery.worker_heartbeat_at = (
+            timezone.now() - timedelta(minutes=10)
+        )
+        self.delivery.save(
+            update_fields=[
+                "status",
+                "claim_token",
+                "worker_heartbeat_at",
+            ]
+        )
+        Delivery.objects.filter(pk=self.delivery.pk).update(
+            updated_at=timezone.now()
+        )
+
+        self.run_processor()
+
+        self.delivery.refresh_from_db()
+        self.assertEqual(self.delivery.status, Delivery.Status.PROCESSING)
+        self.assertNotEqual(self.delivery.claim_token, token)
+        self.assertEqual(
+            self.delivery.last_error,
+            "Recovered stale processing delivery.",
+        )
+        self.assertIsNotNone(self.delivery.worker_heartbeat_at)
+        self.assertEqual(
+            OutboxMessage.objects.get(delivery=self.delivery).status,
+            OutboxMessage.Status.PENDING,
+        )
+
+    def test_stale_processing_with_pending_outbox_is_not_recovered(self):
+        token = uuid.uuid4()
+        self.delivery.status = Delivery.Status.PROCESSING
+        self.delivery.claim_token = token
+        self.delivery.save(update_fields=["status", "claim_token"])
+
+        OutboxMessage.objects.create(
+            delivery=self.delivery,
+            claim_token=token,
+            task_payload={"delivery_id": self.delivery.pk},
+            next_attempt_at=timezone.now() + timedelta(minutes=5),
+        )
+
+        Delivery.objects.filter(pk=self.delivery.pk).update(
+            updated_at=timezone.now() - timedelta(minutes=10)
+        )
+
+        self.run_processor()
+
+        self.delivery.refresh_from_db()
+        self.assertEqual(
+            self.delivery.status,
+            Delivery.Status.PROCESSING,
+        )
+        self.assertEqual(self.delivery.claim_token, token)
+        self.assertEqual(OutboxMessage.objects.count(), 1)
+
+    def test_stale_delivery_at_attempt_limit_is_failed(self):
         self.delivery.status = Delivery.Status.PROCESSING
         self.delivery.attempt_count = self.delivery.max_attempts
         self.delivery.save(update_fields=["status", "attempt_count"])
@@ -244,15 +311,12 @@ class DeliveryRetryCommandTests(TestCase):
             updated_at=timezone.now() - timedelta(minutes=10)
         )
 
-        call_command(
-            "process_delivery_retries",
-            stale_after_seconds=300,
-        )
+        self.run_processor()
 
         self.delivery.refresh_from_db()
-        publish_mock.assert_not_called()
         self.assertEqual(self.delivery.status, Delivery.Status.FAILED)
         self.assertIsNone(self.delivery.next_retry_at)
+        self.assertEqual(OutboxMessage.objects.count(), 0)
 
 class DeliveryResultCallbackTests(TestCase):
     def setUp(self):
@@ -286,6 +350,42 @@ class DeliveryResultCallbackTests(TestCase):
         )
 
         self.url = f"/api/deliveries/{self.delivery.pk}/result/"
+
+    def test_heartbeat_refreshes_current_claim(self):
+        before = timezone.now() - timedelta(minutes=2)
+        Delivery.objects.filter(pk=self.delivery.pk).update(
+            worker_heartbeat_at=before
+        )
+
+        response = self.client.post(
+            f"/api/deliveries/{self.delivery.pk}/heartbeat/",
+            {"claim_token": str(self.delivery.claim_token)},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["active"])
+        self.delivery.refresh_from_db()
+        self.assertGreater(self.delivery.worker_heartbeat_at, before)
+
+    def test_heartbeat_ignores_stale_claim_token(self):
+        current_token = self.delivery.claim_token
+        old_heartbeat = timezone.now() - timedelta(minutes=2)
+        Delivery.objects.filter(pk=self.delivery.pk).update(
+            worker_heartbeat_at=old_heartbeat
+        )
+
+        response = self.client.post(
+            f"/api/deliveries/{self.delivery.pk}/heartbeat/",
+            {"claim_token": str(uuid.uuid4())},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["active"])
+        self.delivery.refresh_from_db()
+        self.assertEqual(self.delivery.claim_token, current_token)
+        self.assertEqual(self.delivery.worker_heartbeat_at, old_heartbeat)
 
     def test_duplicate_callback_does_not_create_another_attempt(self):
         attempt_id = str(uuid.uuid4())
@@ -421,12 +521,14 @@ class ManualDeliveryRetryTests(TestCase):
         )
         self.url = f"/api/deliveries/{self.delivery.pk}/retry/"
 
-    @patch("apps.deliveries.views.publish_delivery_task")
-    def test_failed_delivery_can_be_manually_retried(self, publish_mock):
+    def test_failed_delivery_can_be_queued_for_manual_retry(self):
         response = self.client.post(self.url, {}, format="json")
 
         self.assertEqual(response.status_code, 202)
-        publish_mock.assert_called_once()
+        self.assertEqual(
+            response.data["message"],
+            "Manual retry queued for publication.",
+        )
 
         self.delivery.refresh_from_db()
         self.assertEqual(
@@ -438,15 +540,22 @@ class ManualDeliveryRetryTests(TestCase):
         self.assertEqual(self.delivery.last_error, "")
         self.assertIsNotNone(self.delivery.claim_token)
 
-    @patch("apps.deliveries.views.publish_delivery_task")
-    def test_non_failed_delivery_cannot_be_retried(self, publish_mock):
+        outbox = OutboxMessage.objects.get(delivery=self.delivery)
+        self.assertEqual(outbox.status, OutboxMessage.Status.PENDING)
+        self.assertEqual(outbox.claim_token, self.delivery.claim_token)
+        self.assertEqual(
+            outbox.task_payload["delivery_id"],
+            self.delivery.pk,
+        )
+
+    def test_non_failed_delivery_cannot_be_retried(self):
         self.delivery.status = Delivery.Status.DELIVERED
         self.delivery.save(update_fields=["status"])
 
         response = self.client.post(self.url, {}, format="json")
 
         self.assertEqual(response.status_code, 409)
-        publish_mock.assert_not_called()
+        self.assertEqual(OutboxMessage.objects.count(), 0)
 
         self.delivery.refresh_from_db()
         self.assertEqual(
@@ -454,28 +563,22 @@ class ManualDeliveryRetryTests(TestCase):
             Delivery.Status.DELIVERED,
         )
 
-    @patch(
-        "apps.deliveries.views.publish_delivery_task",
-        side_effect=RuntimeError("Kafka unavailable"),
-    )
-    def test_publish_failure_restores_failed_status(self, publish_mock):
-        response = self.client.post(self.url, {}, format="json")
-
-        self.assertEqual(response.status_code, 503)
-        publish_mock.assert_called_once()
+    def test_outbox_creation_failure_rolls_back_manual_retry(self):
+        with patch(
+            "apps.deliveries.views.enqueue_delivery_task",
+            side_effect=RuntimeError("Database unavailable"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.client.post(self.url, {}, format="json")
 
         self.delivery.refresh_from_db()
-        self.assertEqual(
-            self.delivery.status,
-            Delivery.Status.FAILED,
-        )
-        self.assertIsNone(self.delivery.next_retry_at)
+        self.assertEqual(self.delivery.status, Delivery.Status.FAILED)
+        self.assertIsNone(self.delivery.claim_token)
         self.assertEqual(
             self.delivery.last_error,
-            "Manual retry could not be published.",
+            "Maximum automatic attempts reached.",
         )
-        self.assertIsNone(self.delivery.claim_token)
-        self.assertEqual(self.delivery.attempt_count, 5)
+        self.assertEqual(OutboxMessage.objects.count(), 0)
 
 
 class RetrySchedulerCommandTests(SimpleTestCase):
@@ -486,7 +589,7 @@ class RetrySchedulerCommandTests(SimpleTestCase):
 
     @patch(f"{command_path}.time.sleep", side_effect=KeyboardInterrupt)
     @patch(f"{command_path}.call_command")
-    def test_runs_retry_command_and_stops_cleanly(
+    def test_runs_retry_and_outbox_commands_and_stops_cleanly(
         self, call_command_mock, sleep_mock
     ):
         call_command(
@@ -496,23 +599,30 @@ class RetrySchedulerCommandTests(SimpleTestCase):
             stale_after_seconds=120,
         )
 
-        call_command_mock.assert_called_once_with(
-            "process_delivery_retries",
-            batch_size=25,
-            stale_after_seconds=120,
+        self.assertEqual(
+            call_command_mock.call_args_list,
+            [
+                call(
+                    "process_delivery_retries",
+                    batch_size=25,
+                    stale_after_seconds=120,
+                ),
+                call("dispatch_outbox", batch_size=25),
+            ],
         )
         sleep_mock.assert_called_once_with(0.5)
 
     @patch(f"{command_path}.time.sleep", side_effect=KeyboardInterrupt)
-    @patch(
-        f"{command_path}.call_command",
-        side_effect=RuntimeError("Simulated scheduler failure"),
-    )
-    def test_logs_run_failure_and_stops_cleanly(
+    @patch(f"{command_path}.call_command")
+    def test_outbox_dispatch_runs_even_if_retry_processing_fails(
         self, call_command_mock, sleep_mock
     ):
         from io import StringIO
 
+        call_command_mock.side_effect = [
+            RuntimeError("Simulated scheduler failure"),
+            None,
+        ]
         stdout = StringIO()
         stderr = StringIO()
 
@@ -523,10 +633,22 @@ class RetrySchedulerCommandTests(SimpleTestCase):
             stderr=stderr,
         )
 
-        call_command_mock.assert_called_once()
+        self.assertEqual(
+            call_command_mock.call_args_list,
+            [
+                call(
+                    "process_delivery_retries",
+                    batch_size=100,
+                    stale_after_seconds=300,
+                ),
+                call("dispatch_outbox", batch_size=100),
+            ],
+        )
         sleep_mock.assert_called_once_with(1)
-        self.assertIn("Retry scheduler run failed", stderr.getvalue())
-        self.assertIn("Simulated scheduler failure", stderr.getvalue())
+        self.assertIn(
+            "process_delivery_retries failed: Simulated scheduler failure",
+            stderr.getvalue(),
+        )
         self.assertIn("Retry scheduler stopped", stdout.getvalue())
 
     def test_invalid_options_are_rejected(self):

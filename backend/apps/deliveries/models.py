@@ -37,6 +37,11 @@ class Delivery(models.Model):
         blank=True,
         editable=False,
     )
+    worker_heartbeat_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        editable=False,
+    )
     last_attempt_at = models.DateTimeField(null=True, blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
 
@@ -124,4 +129,53 @@ class DeliveryAttempt(models.Model):
         return (
             f"Attempt {self.attempt_number} "
             f"for Delivery #{self.delivery_id}"
+        )
+
+
+class OutboxMessage(models.Model):
+    """Durable record of a delivery task awaiting Kafka publication."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        PUBLISHED = "published", "Published"
+        SUPERSEDED = "superseded", "Superseded"
+
+    delivery = models.ForeignKey(
+        Delivery,
+        on_delete=models.CASCADE,
+        related_name="outbox_messages",
+    )
+    claim_token = models.UUIDField(editable=False)
+    task_payload = models.JSONField()
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+    publish_attempts = models.PositiveIntegerField(default=0)
+    next_attempt_at = models.DateTimeField()
+    last_error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["delivery", "claim_token"],
+                name="unique_outbox_delivery_claim",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["status", "next_attempt_at"],
+                name="outbox_status_next_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"Outbox #{self.pk}: delivery #{self.delivery_id} "
+            f"({self.status})"
         )
