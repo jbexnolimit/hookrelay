@@ -10,7 +10,7 @@ class Command(BaseCommand):
     help = "Create or update HookRelay demo webhook endpoints."
 
     def handle(self, *args, **options):
-        base_url = os.getenv("HOOKRELAY_LOCAL_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+        base_url = os.getenv("HOOKRELAY_LOCAL_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
         recovery_config, created = RecoveryReceiverConfig.objects.get_or_create(
             key="default",
             defaults={
