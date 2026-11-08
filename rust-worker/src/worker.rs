@@ -403,6 +403,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_retry_reuses_attempt_id_without_repeating_webhook() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base_url = format!("http://{address}");
+
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+
+            // Expected order:
+            // heartbeat, webhook, heartbeat, failed callback,
+            // heartbeat, successful callback.
+            for index in 0..6 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_http_request(&mut stream).await);
+
+                if index == 3 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    respond_ok(&mut stream).await;
+                }
+            }
+
+            requests
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+
+        let config = Config {
+            kafka_brokers: String::new(),
+            kafka_topic: String::new(),
+            kafka_group_id: String::new(),
+            django_api_base_url: base_url.clone(),
+            http_timeout_seconds: 3,
+        };
+
+        let claim_token = uuid::Uuid::new_v4();
+        let task = DeliveryTask {
+            delivery_id: 42,
+            claim_token,
+            event_id: 7,
+            event_type: "order.created".to_string(),
+            payload: json!({"order_id": "ORD-1001"}),
+            webhook_url: format!("{base_url}/receiver"),
+        };
+
+        process_delivery(&client, &config, &task)
+            .await
+            .expect("delivery should succeed after callback recovery");
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 6);
+
+        assert!(requests[0].contains("/api/deliveries/42/heartbeat/"));
+        assert!(requests[1].contains("POST /receiver "));
+        assert!(requests[2].contains("/api/deliveries/42/heartbeat/"));
+        assert!(requests[3].contains("/api/deliveries/42/result/"));
+        assert!(requests[4].contains("/api/deliveries/42/heartbeat/"));
+        assert!(requests[5].contains("/api/deliveries/42/result/"));
+
+        let callback_body = |request: &str| -> serde_json::Value {
+            let (_, body) = request
+                .split_once("\r\n\r\n")
+                .expect("HTTP request should contain a body separator");
+            serde_json::from_str(body).expect("callback body should be valid JSON")
+        };
+
+        let first_result = callback_body(&requests[3]);
+        let second_result = callback_body(&requests[5]);
+
+        assert_eq!(
+            first_result["attempt_id"], second_result["attempt_id"],
+            "callback retries must reuse the same attempt ID"
+        );
+        assert_eq!(
+            first_result["claim_token"], second_result["claim_token"],
+            "callback retries must reuse the same claim token"
+        );
+        assert_eq!(
+            first_result["success"], true,
+            "the successful webhook response should be reported"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.contains("POST /receiver "))
+                .count(),
+            1,
+            "callback retries must not repeat the webhook request"
+        );
+    }
+
+    #[tokio::test]
     async fn inactive_claim_stops_before_calling_webhook() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
