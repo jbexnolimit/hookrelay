@@ -104,6 +104,30 @@ async fn publish_rejected_message(
     Ok(())
 }
 
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).context("Failed to install SIGTERM handler")?;
+
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("Failed to listen for Ctrl+C")
+            }
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("Failed to listen for Ctrl+C")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -149,13 +173,23 @@ async fn main() -> Result<()> {
         "HookRelay Rust worker started; waiting for tasks"
     );
 
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+
     loop {
-        let message = match consumer.recv().await {
-            Ok(message) => message,
-            Err(error) => {
-                error!(error = %error, "Kafka receive error");
-                sleep(Duration::from_secs(2)).await;
-                continue;
+        let message = tokio::select! {
+            result = &mut shutdown_signal => {
+                result?;
+                info!("Shutdown signal received; stopping worker");
+                break;
+            }
+            result = consumer.recv() => match result {
+                Ok(message) => message,
+                Err(error) => {
+                    error!(error = %error, "Kafka receive error");
+                    sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
             }
         };
 
@@ -219,6 +253,8 @@ async fn main() -> Result<()> {
 
         info!(delivery_id = task.delivery_id, "Kafka task committed");
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
