@@ -245,7 +245,26 @@ async fn main() -> Result<()> {
         );
 
         // Do not commit the Kafka offset until Django accepts the result.
-        worker::process_delivery(&http_client, &config, &task).await?;
+        // If shutdown wins, cancel processing and leave the message uncommitted
+        // so Kafka can redeliver it after the worker restarts.
+        let processing_completed = tokio::select! {
+            result = worker::process_delivery(&http_client, &config, &task) => {
+                result?;
+                true
+            }
+            result = &mut shutdown_signal => {
+                result?;
+                info!(
+                    delivery_id = task.delivery_id,
+                    "Shutdown signal received during delivery; leaving Kafka offset uncommitted"
+                );
+                false
+            }
+        };
+
+        if !processing_completed {
+            break;
+        }
 
         consumer
             .commit_message(&message, CommitMode::Sync)
