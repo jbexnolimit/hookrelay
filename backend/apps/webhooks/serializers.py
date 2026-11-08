@@ -1,3 +1,5 @@
+from urllib.parse import urlsplit
+
 from rest_framework import serializers
 
 from .models import WebhookEndpoint
@@ -22,6 +24,16 @@ class WebhookEndpointSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate_url(self, value):
+        scheme = urlsplit(value).scheme.lower()
+
+        if scheme not in {"http", "https"}:
+            raise serializers.ValidationError(
+                "The destination URL must use HTTP or HTTPS."
+            )
+
+        return value
 
     def validate_event_types(self, value):
         if len(value) != len(set(value)):
