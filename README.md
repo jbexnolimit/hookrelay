@@ -412,6 +412,55 @@ The delivery test suite covers:
 - Callback idempotency
 - Late delivery callbacks
 
+## Dead-Letter Queue (DLQ)
+
+The Rust worker sends malformed delivery-task messages and empty Kafka
+messages to `hookrelay.delivery-tasks.dlq` by default. Set `KAFKA_DLQ_TOPIC`
+to override the destination.
+
+Each DLQ record is a JSON envelope containing the source topic, partition,
+offset, rejection reason, rejection timestamp, and original payload bytes.
+The original payload is represented as an array of integers, or `null` if
+the Kafka message has no payload.
+
+The worker commits the source offset only after DLQ publication succeeds.
+If publication fails, it exits without committing the rejected message.
+Restart it with a working DLQ destination and the same consumer group to
+retry the message. Delivery is at-least-once: duplicate DLQ records are
+possible if publishing succeeds but committing the source offset fails.
+
+### Inspect the DLQ
+
+These commands assume Kafka is running in the `hookrelay-kafka` container.
+
+Describe the topic:
+
+```bash
+docker exec hookrelay-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic hookrelay.delivery-tasks.dlq
+```
+
+Read records from the beginning; press `Ctrl+C` to stop:
+
+```bash
+docker exec hookrelay-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic hookrelay.delivery-tasks.dlq --from-beginning
+```
+
+### Safe recovery
+
+Inspect the rejection reason and source location. Decode and validate the
+original payload, fix the underlying issue, and only then consider replay.
+Check for duplicate side effects before replaying. HookRelay does not
+currently provide an automatic replay command; avoid blind replay or
+consumer offset resets.
+
+### Integration test
+
+Run `./scripts/test-dlq-integration.sh` from the repository root. It requires
+Docker, the running Kafka container, Rust/Cargo, and Python 3. It verifies
+that failed DLQ publication does not advance the source offset and that
+recovery publishes the envelope and commits the offset. Unique test topics
+are retained for inspection and are not deleted automatically.
+
 ## Docker Commands
 
 Start infrastructure:
@@ -443,6 +492,13 @@ Docker Compose uses named volumes to persist PostgreSQL and Kafka data. Stopping
 **Warning:** Avoid `docker compose down -v` unless you intentionally want to delete the persistent volumes and their data.
 
 ## Troubleshooting
+
+### Messages are not reaching the DLQ
+
+- Check the worker's `KAFKA_DLQ_TOPIC` and Kafka connectivity.
+- Look for `DLQ publication failed; source message will not be committed` in worker logs.
+- Correct the destination or permissions, then restart with the same consumer group to retry the uncommitted message.
+
 
 **Docker permission denied**
 

@@ -72,14 +72,26 @@ async fn publish_rejected_message(
     let payload =
         serde_json::to_vec(&envelope).context("Failed to serialize dead-letter envelope")?;
 
-    producer
+    let publish_result = producer
         .send(
             FutureRecord::to(dlq_topic).key(&key).payload(&payload),
             Timeout::After(Duration::from_secs(5)),
         )
-        .await
-        .map_err(|(error, _)| anyhow::anyhow!(error))
-        .context("Failed to publish rejected message to dead-letter topic")?;
+        .await;
+
+    if let Err((error, _)) = publish_result {
+        error!(
+            source_topic = %envelope.source_topic,
+            source_partition = envelope.source_partition,
+            source_offset = envelope.source_offset,
+            dlq_topic = %dlq_topic,
+            error = %error,
+            "DLQ publication failed; source message will not be committed"
+        );
+
+        return Err(anyhow::anyhow!(error))
+            .context("Failed to publish rejected message to dead-letter topic");
+    }
 
     warn!(
         source_topic = %envelope.source_topic,
