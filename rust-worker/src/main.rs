@@ -9,11 +9,88 @@ use models::DeliveryTask;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::Timeout;
 
-use std::time::Duration;
+use serde::Serialize;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+#[derive(Debug, Serialize)]
+struct DlqEnvelope {
+    source_topic: String,
+    source_partition: i32,
+    source_offset: i64,
+    rejection_reason: String,
+    rejected_at_unix_ms: u64,
+    original_payload: Option<Vec<u8>>,
+}
+
+fn build_dlq_envelope(
+    source_topic: &str,
+    source_partition: i32,
+    source_offset: i64,
+    rejection_reason: &str,
+    original_payload: Option<&[u8]>,
+) -> DlqEnvelope {
+    let rejected_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    DlqEnvelope {
+        source_topic: source_topic.to_string(),
+        source_partition,
+        source_offset,
+        rejection_reason: rejection_reason.to_string(),
+        rejected_at_unix_ms,
+        original_payload: original_payload.map(<[u8]>::to_vec),
+    }
+}
+
+async fn publish_rejected_message(
+    producer: &FutureProducer,
+    dlq_topic: &str,
+    message: &impl Message,
+    rejection_reason: &str,
+    original_payload: Option<&[u8]>,
+) -> Result<()> {
+    let envelope = build_dlq_envelope(
+        message.topic(),
+        message.partition(),
+        message.offset(),
+        rejection_reason,
+        original_payload,
+    );
+
+    let key = format!(
+        "{}-{}-{}",
+        envelope.source_topic, envelope.source_partition, envelope.source_offset
+    );
+    let payload =
+        serde_json::to_vec(&envelope).context("Failed to serialize dead-letter envelope")?;
+
+    producer
+        .send(
+            FutureRecord::to(dlq_topic).key(&key).payload(&payload),
+            Timeout::After(Duration::from_secs(5)),
+        )
+        .await
+        .map_err(|(error, _)| anyhow::anyhow!(error))
+        .context("Failed to publish rejected message to dead-letter topic")?;
+
+    warn!(
+        source_topic = %envelope.source_topic,
+        partition = envelope.source_partition,
+        offset = envelope.source_offset,
+        dlq_topic = %dlq_topic,
+        "Rejected message published to dead-letter queue"
+    );
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,6 +108,14 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(config.http_timeout_seconds))
         .build()
         .context("Failed to create HTTP client")?;
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &config.kafka_brokers)
+        .set("acks", "all")
+        .set("request.timeout.ms", "10000")
+        .set("delivery.timeout.ms", "30000")
+        .create()
+        .context("Failed to create Kafka DLQ producer")?;
 
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", &config.kafka_brokers)
@@ -65,13 +150,18 @@ async fn main() -> Result<()> {
         let payload = match message.payload() {
             Some(payload) => payload,
             None => {
-                warn!(
-                    offset = message.offset(),
-                    "Received an empty Kafka message; skipping it"
-                );
+                publish_rejected_message(
+                    &producer,
+                    &config.kafka_dlq_topic,
+                    &message,
+                    "Kafka message has no payload",
+                    None,
+                )
+                .await?;
 
-                // Prevent an empty message from blocking this partition.
-                consumer.commit_message(&message, CommitMode::Sync)?;
+                consumer
+                    .commit_message(&message, CommitMode::Sync)
+                    .context("Failed to commit dead-lettered empty Kafka message")?;
                 continue;
             }
         };
@@ -82,11 +172,21 @@ async fn main() -> Result<()> {
                 error!(
                     error = %error,
                     offset = message.offset(),
-                    "Invalid delivery task JSON; skipping message"
+                    "Invalid delivery task JSON; sending message to DLQ"
                 );
 
-                // A dead-letter queue can replace this behavior later.
-                consumer.commit_message(&message, CommitMode::Sync)?;
+                publish_rejected_message(
+                    &producer,
+                    &config.kafka_dlq_topic,
+                    &message,
+                    &format!("Invalid delivery task JSON: {error}"),
+                    Some(payload),
+                )
+                .await?;
+
+                consumer
+                    .commit_message(&message, CommitMode::Sync)
+                    .context("Failed to commit dead-lettered invalid Kafka message")?;
                 continue;
             }
         };
@@ -106,5 +206,53 @@ async fn main() -> Result<()> {
             .context("Failed to commit processed Kafka message")?;
 
         info!(delivery_id = task.delivery_id, "Kafka task committed");
+    }
+}
+
+#[cfg(test)]
+mod dlq_tests {
+    use super::*;
+
+    #[test]
+    fn envelope_preserves_metadata_and_original_bytes() {
+        let original = [0_u8, 255, 10, 128];
+
+        let envelope = build_dlq_envelope(
+            "hookrelay.delivery-tasks",
+            2,
+            123,
+            "Invalid JSON",
+            Some(&original),
+        );
+
+        let json = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(json["source_topic"], "hookrelay.delivery-tasks");
+        assert_eq!(json["source_partition"], 2);
+        assert_eq!(json["source_offset"], 123);
+        assert_eq!(json["rejection_reason"], "Invalid JSON");
+        assert!(json["rejected_at_unix_ms"].as_u64().is_some());
+        assert_eq!(
+            json["original_payload"],
+            serde_json::json!([0, 255, 10, 128])
+        );
+    }
+
+    #[test]
+    fn envelope_records_missing_payload_as_null() {
+        let envelope = build_dlq_envelope(
+            "hookrelay.delivery-tasks",
+            0,
+            9,
+            "Kafka message has no payload",
+            None,
+        );
+
+        let json = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(json["source_partition"], 0);
+        assert_eq!(json["source_offset"], 9);
+        assert_eq!(json["rejection_reason"], "Kafka message has no payload");
+        assert!(json["original_payload"].is_null());
     }
 }

@@ -67,6 +67,13 @@ services:
           --topic hookrelay.delivery-tasks \
           --partitions 1 \
           --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:29092 \
+          --create \
+          --if-not-exists \
+          --topic hookrelay.delivery-tasks.dlq \
+          --partitions 1 \
+          --replication-factor 1
     restart: "no"
 
 volumes:

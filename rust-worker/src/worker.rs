@@ -301,6 +301,7 @@ mod tests {
         let config = Config {
             kafka_brokers: String::new(),
             kafka_topic: String::new(),
+            kafka_dlq_topic: String::new(),
             kafka_group_id: String::new(),
             django_api_base_url: base_url.clone(),
             http_timeout_seconds: 3,
@@ -372,6 +373,7 @@ mod tests {
         let config = Config {
             kafka_brokers: String::new(),
             kafka_topic: String::new(),
+            kafka_dlq_topic: String::new(),
             kafka_group_id: String::new(),
             django_api_base_url: base_url.clone(),
             http_timeout_seconds: 3,
@@ -441,6 +443,7 @@ mod tests {
         let config = Config {
             kafka_brokers: String::new(),
             kafka_topic: String::new(),
+            kafka_dlq_topic: String::new(),
             kafka_group_id: String::new(),
             django_api_base_url: base_url.clone(),
             http_timeout_seconds: 3,
@@ -529,6 +532,7 @@ mod tests {
         let config = Config {
             kafka_brokers: String::new(),
             kafka_topic: String::new(),
+            kafka_dlq_topic: String::new(),
             kafka_group_id: String::new(),
             django_api_base_url: base_url.clone(),
             http_timeout_seconds: 3,

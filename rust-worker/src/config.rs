@@ -5,6 +5,7 @@ use std::env;
 pub struct Config {
     pub kafka_brokers: String,
     pub kafka_topic: String,
+    pub kafka_dlq_topic: String,
     pub kafka_group_id: String,
     pub django_api_base_url: String,
     pub http_timeout_seconds: u64,
@@ -24,6 +25,7 @@ impl Config {
         Ok(Self {
             kafka_brokers: env_or("KAFKA_BROKERS", "127.0.0.1:9092"),
             kafka_topic: env_or("KAFKA_TOPIC", "hookrelay.delivery-tasks"),
+            kafka_dlq_topic: env_or("KAFKA_DLQ_TOPIC", "hookrelay.delivery-tasks.dlq"),
             kafka_group_id: env_or("KAFKA_GROUP_ID", "hookrelay-rust-worker"),
             django_api_base_url: env_or("DJANGO_API_BASE_URL", "http://127.0.0.1:8001"),
             http_timeout_seconds,
